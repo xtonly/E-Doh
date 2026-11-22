@@ -1,13 +1,13 @@
 cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
 # ========================================================================================
-# Project   : Easy-DoH Manager (v2.7 Release)
+# Project   : Easy-DoH Manager (v2.8 Release)
 # Author    : xtonly
-# Features  : Pure-IP Bootstrap DoH/DoT | Docker DNS Guard | Zero-Trace Purge
+# Features  : Pure-IP DoH/DoT | Single-Bootstrap Zero-Error | Zero-Trace Purge
 # Usage     : Interactive -> doh | Unattended -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
 # ========================================================================================
 
-VERSION="2.7"
+VERSION="2.8"
 GH_REPO="xtonly/Easy-DoH"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
@@ -42,7 +42,6 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 免 53 端口通过纯 IP HTTPS (443) JSON API 查询域名 IP
 doh_lookup_ip() {
     local domain="$1" ip=""
     for api in "https://1.1.1.1/dns-query" "https://8.8.8.8/resolve"; do
@@ -53,7 +52,6 @@ doh_lookup_ip() {
     echo "$ip"
 }
 
-# 支持免 DNS 环境拉取远程文件 (带多 CDN 自动回退)
 fetch_remote_script() {
     local target="$1" url host rip res_arg=()
     for url in "${RAW_URLS[@]}"; do
@@ -72,7 +70,6 @@ fetch_remote_script() {
     return 1
 }
 
-# 管道自举安装检测
 bootstrap_self() {
     if [ ! -f "$0" ] || [[ "$0" == *"/dev/fd/"* ]] || [ "$0" = "bash" ] || [ "$0" = "-bash" ]; then
         echo -e "${CYAN}[Init] 检测到管道流执行，正在将管理命令固化至 ${SCRIPT_PATH} ...${PLAIN}"
@@ -95,7 +92,6 @@ pause_return() {
     read -rp "按回车键返回主菜单 / Press Enter to return..." _ </dev/tty
 }
 
-# 保存首次安装前的系统原始 DNS 状态 (包含符号链接目标识别)
 save_orig_resolv() {
     mkdir -p "$WORK_DIR" "$BACKUP_DIR"
     if [ ! -f "${WORK_DIR}/resolv.conf.orig" ] && [ ! -f "${WORK_DIR}/resolv.symlink" ]; then
@@ -107,7 +103,6 @@ save_orig_resolv() {
     fi
 }
 
-# 自动备份轮转 (严格保留最新 3 份归档)
 backup_configs() {
     mkdir -p "$WORK_DIR" "$BACKUP_DIR"
     save_orig_resolv
@@ -205,13 +200,14 @@ RES_EOF
     fi
 }
 
+# 单一极速纯 IP Bootstrap + 纯 IP 证书节点优先，100% 根除多 Bootstrap 抢答导致的 context canceled
 write_doh_config() {
     mkdir -p "$WORK_DIR"
     local mode="${1:-global}" custom_u1="$2" custom_u2="$3" dip
     dip=$(get_docker_ip)
 
     cat << YAML_EOF > "$CONF_FILE"
-# Easy-DoH Config v${VERSION} (TCP + UDP Port 53 | Smart Load-Balance)
+# Easy-DoH Config v${VERSION} (TCP + UDP Port 53 | Zero-Cancel Load-Balance)
 listen-addrs:
   - "127.0.0.1"
 YAML_EOF
@@ -226,7 +222,6 @@ cache-size: 4194304
 cache-optimistic: true
 timeout: 4s
 bootstrap:
-  - "https://1.1.1.1/dns-query"
   - "https://8.8.8.8/dns-query"
 YAML_PORT
 
@@ -258,12 +253,13 @@ fallback:
 UP_APAC
             ;;
         eu|eu_opt)
-            echo "Europe UK/DE/NL (Quad9-ECS 9.9.9.11 + CF + Mullvad + DNS.SB)" > "$STATE_FILE"
+            # 全部使用原生 IP SAN 证书直连 (Quad9 9.9.9.11 + CF 1.1.1.1 + Mullvad 194.242.2.2 + DNS.SB)
+            echo "Europe Pure-IP (Quad9 9.9.9.11 + CF + Mullvad 194.242.2.2 + DNS.SB)" > "$STATE_FILE"
             cat << 'UP_EU' >> "$CONF_FILE"
 upstream:
   - "https://9.9.9.11/dns-query"
   - "https://1.1.1.1/dns-query"
-  - "https://dns.mullvad.net/dns-query"
+  - "https://194.242.2.2/dns-query"
   - "https://185.222.222.222/dns-query"
 fallback:
   - "tls://9.9.9.11:853"
@@ -285,8 +281,7 @@ UP_NA
             ;;
         cn|cn_opt)
             echo "CN Mainland (AliDNS + DNSPod + 360 Anti-RateLimit)" > "$STATE_FILE"
-            sed -i 's|https://1.1.1.1/dns-query|https://223.5.5.5/dns-query|' "$CONF_FILE"
-            sed -i 's|https://8.8.8.8/dns-query|https://223.6.6.6/dns-query|' "$CONF_FILE"
+            sed -i 's|https://8.8.8.8/dns-query|https://223.5.5.5/dns-query|' "$CONF_FILE"
             cat << 'UP_CN' >> "$CONF_FILE"
 upstream:
   - "https://223.5.5.5/dns-query"
@@ -428,7 +423,6 @@ PY_EOF
     fi
 }
 
-# 撤销 Docker 网桥 DNS 注入与防火墙规则
 revert_docker_dns() {
     local dip=""
     [ -f "${WORK_DIR}/docker_ip.state" ] && dip=$(cat "${WORK_DIR}/docker_ip.state")
@@ -527,7 +521,7 @@ deploy_doh_wizard() {
     echo -e "  ${GREEN}[1]${PLAIN} 全球纯 IP 零延迟组 (Global Pure-IP) : Quad9-ECS(9.9.9.11) + CF + Google + DNS.SB [默认]"
     echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体组   (Taiwan Local)   : TWNIC(101.101限台) + HiNet + Google + CF"
     echo -e "  ${GREEN}[3]${PLAIN} 亚太新港日优化组   (HK / JP / SG)   : CF + Google + DNS.SB + 日本IIJ骨干"
-    echo -e "  ${GREEN}[4]${PLAIN} 欧洲专线低延迟组   (UK / DE / NL)   : Quad9-ECS + CF + Mullvad(瑞典) + DNS.SB"
+    echo -e "  ${GREEN}[4]${PLAIN} 欧洲纯 IP 低延迟组 (UK / DE / NL)   : Quad9-ECS + CF + Mullvad(194.242.2.2) + DNS.SB"
     echo -e "  ${GREEN}[5]${PLAIN} 北美专线极速组     (US / CA)        : Quad9-ECS + CF + OpenDNS + ControlD(p0)"
     echo -e "  ${GREEN}[6]${PLAIN} 中国大陆防限速组   (CN Mainland)    : 阿里DoH + 腾讯doh.pub + 360DoH 负载均衡"
     echo -e "  ${GREEN}[7]${PLAIN} 自定义加密上游     (Custom DoH URL) : 手动输入主/备 DoH 或 DoT 地址"
@@ -571,7 +565,7 @@ benchmark_global_upstreams() {
         "Cloudflare|https://1.1.1.1/dns-query|全球泛播 Anycast (1.1.1.1)"
         "Google ECS|https://8.8.8.8/dns-query|全球泛播 + ECS (8.8.8.8)"
         "DNS.SB (xTom)|https://185.222.222.222/dns-query|欧/亚太骨干 + ECS (185.222)"
-        "Mullvad Europe|https://dns.mullvad.net/dns-query|欧洲高隐私低延迟 (mullvad.net)"
+        "Mullvad Europe|https://194.242.2.2/dns-query|欧洲纯IP高隐私 (194.242.2.2)"
         "OpenDNS Cisco|https://doh.opendns.com/dns-query|北美/欧洲骨干网 (opendns.com)"
         "Control D (p0)|https://freedns.controld.com/p0|北美/全球纯净版 (controld.com)"
         "AdGuard Pure|https://94.140.14.140/dns-query|全球无过滤 + ECS (94.140.14.140)"
@@ -712,6 +706,25 @@ audit_leaks() {
     echo -e "${DIV_BOLD}"
 }
 
+# 仅显示当前运行实例的纯净日志，避免历史旧会话日志干扰
+show_live_logs() {
+    echo -e "\n${DIV_BOLD}"
+    echo -e " ${CYAN}当前实例运行日志 / Current Service Instance Logs${PLAIN}"
+    echo -e "${DIV_THIN}"
+    if systemctl is-active --quiet easy-doh; then
+        local since_ts
+        since_ts=$(systemctl show easy-doh -p ActiveEnterTimestamp --value 2>/dev/null)
+        if [ -n "$since_ts" ]; then
+            journalctl -u easy-doh --since "$since_ts" -n 30 --no-pager
+        else
+            journalctl -u easy-doh -n 25 --no-pager
+        fi
+    else
+        echo -e "  ${GRAY}当前 easy-doh 未运行 (Service is currently stopped).${PLAIN}"
+    fi
+    echo -e "${DIV_BOLD}"
+}
+
 update_self_and_core() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}在线无损更新 / Lossless Update (Script + dnsproxy Core)${PLAIN}"
@@ -743,11 +756,10 @@ update_self_and_core() {
     fi
 }
 
-# 核心无痕清理执行器 (彻底还原配置 + 删除全部备份、日志、内核与残留文件)
 purge_core() {
     local remove_self="${1:-0}"
 
-    echo -e "\n${CYAN}[1/4] 停止并移除加密 DNS 守护进程与历史日志...${PLAIN}"
+    echo -e "\n${CYAN}[1/4] 停止并移除加密 DNS 守护进程与全部历史日志...${PLAIN}"
     systemctl stop easy-doh 2>/dev/null || true
     systemctl disable easy-doh 2>/dev/null || true
     systemctl stop doh-proxy 2>/dev/null || true
@@ -757,6 +769,8 @@ purge_core() {
           /etc/systemd/resolved.conf.d/99-native-dot.conf \
           /etc/systemd/resolved.conf.d/nodnsstub.conf
     systemctl daemon-reload
+    # 先强制切分活跃日志再清理，确保历史 journal 记录彻底清零
+    journalctl --rotate >/dev/null 2>&1 || true
     journalctl --vacuum-time=1s --unit=easy-doh >/dev/null 2>&1 || true
 
     echo -e "${CYAN}[2/4] 恢复初始 /etc/resolv.conf 并解除防篡改锁...${PLAIN}"
@@ -785,10 +799,10 @@ purge_core() {
 
     if [ "$remove_self" -eq 1 ]; then
         rm -f "$SCRIPT_PATH" "${SCRIPT_PATH}.new" "${SCRIPT_PATH}.tmp"
-        echo -e "\n${GREEN}[OK] 已完成 100% 零残留彻底卸载（包含所有备份、内核与 doh 命令本身）！${PLAIN}\n"
+        echo -e "\n${GREEN}[OK] 已完成 100% 零残留彻底卸载（包含所有备份、日志、内核与 doh 命令本身）！${PLAIN}\n"
         exit 0
     else
-        echo -e "\n${GREEN}[OK] 服务、内核与全部历史备份已彻底清空！(仅保留 doh 管理脚本)${PLAIN}"
+        echo -e "\n${GREEN}[OK] 服务、内核、日志与全部历史备份已彻底清空！(仅保留 doh 管理脚本)${PLAIN}"
     fi
 }
 
@@ -861,7 +875,7 @@ render_menu() {
     echo -e "  ${GREEN}[4]${PLAIN} 实测本地 DNS 解析 (IPv4/IPv6) (Test Local DNS Resolution)"
     echo -e "  ${GREEN}[5]${PLAIN} 全球 12 大 DoH 并发测速排行   (Global DoH Upstream Speedtest)"
     echo -e "  ${GREEN}[6]${PLAIN} 全盘扫描 53 端口漏网之鱼      (Audit Port 53 Leaks)"
-    echo -e "  ${GREEN}[7]${PLAIN} 查看服务实时运行日志          (View Service Logs)"
+    echo -e "  ${GREEN}[7]${PLAIN} 查看当前实例运行日志          (View Current Instance Logs)"
     echo -e "  ${GREEN}[8]${PLAIN} 解锁 / 锁定 /etc/resolv.conf  (Toggle Resolv +i Lock)"
     echo -e "  ${GREEN}[9]${PLAIN} 在线无损更新脚本与内核        (Lossless Update Script & Core)"
     echo -e "  ${GREEN}[10]${PLAIN} 彻底卸载并清空全部备份       (Complete Uninstall & Purge)"
@@ -869,7 +883,6 @@ render_menu() {
     echo -e "${DIV_BOLD}"
 }
 
-# CLI 非交互自动化入口支持 (doh --auto tw | doh --purge | doh --test | doh --audit)
 case "${1:-}" in
     --auto)
         cp -f "$0" "$SCRIPT_PATH" 2>/dev/null && chmod +x "$SCRIPT_PATH"
@@ -905,7 +918,7 @@ while true; do
         4) test_all_dns; pause_return ;;
         5) benchmark_global_upstreams; pause_return ;;
         6) audit_leaks; pause_return ;;
-        7) echo ""; journalctl -u easy-doh -n 25 --no-pager; pause_return ;;
+        7) show_live_logs; pause_return ;;
         8)
             if lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
                 chattr -i /etc/resolv.conf
