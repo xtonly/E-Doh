@@ -1,21 +1,22 @@
+cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
 # ==============================================================================
-# Project   : Easy-DoH Manager (v2.6 Release)
+# Project   : Easy-DoH Manager (v2.7 Release)
 # Author    : xtonly
-# Features  : Pure-IP Bootstrap DoH/DoT | Docker DNS Guard | Speedtest | CLI/TUI
-# Usage     : Interactive -> doh | Unattended -> doh --auto [global|tw|apac|eu|na|cn]
+# Features  : Pure-IP Bootstrap DoH/DoT | Docker DNS Guard | Zero-Trace Purge
+# Usage     : Interactive -> doh | Unattended -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
 # ==============================================================================
 
-VERSION="2.6"
+VERSION="2.7"
 GH_REPO="xtonly/Easy-DoH"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
 
-# 多源下载回退链 (GitHub 主源优先 -> Cloudflare Workers 镜像 -> Fastly jsDelivr 兜底)
+# 多源下载回退链 (GitHub 主源优先 -> Cloudflare jsDelivr -> Fastly jsDelivr 兜底)
 RAW_URLS=(
     "https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/doh.sh"
-    "https://gh-proxy.com/https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/doh.sh"
     "https://testingcf.jsdelivr.net/gh/${GH_REPO}@${GH_BRANCH}/doh.sh"
+    "https://fastly.jsdelivr.net/gh/${GH_REPO}@${GH_BRANCH}/doh.sh"
 )
 
 RED='\033[1;31m'
@@ -40,7 +41,6 @@ if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[Error] 请使用 root 权限运行 (Please run as root: sudo doh)${PLAIN}"
     exit 1
 fi
-mkdir -p "$WORK_DIR" "$BACKUP_DIR"
 
 # 免 53 端口通过纯 IP HTTPS (443) JSON API 查询域名 IP
 doh_lookup_ip() {
@@ -72,7 +72,7 @@ fetch_remote_script() {
     return 1
 }
 
-# 管道自举安装检测：若通过 curl | bash 运行，自动固化到 /usr/local/bin/doh 并移交终端控制权
+# 管道自举安装检测
 bootstrap_self() {
     if [ ! -f "$0" ] || [[ "$0" == *"/dev/fd/"* ]] || [ "$0" = "bash" ] || [ "$0" = "-bash" ]; then
         echo -e "${CYAN}[Init] 检测到管道流执行，正在将管理命令固化至 ${SCRIPT_PATH} ...${PLAIN}"
@@ -82,7 +82,7 @@ bootstrap_self() {
             echo -e "${GREEN}[OK] 命令固化成功！以后随时输入 'doh' 即可呼出面板。${PLAIN}"
             exec "$SCRIPT_PATH" "$@" </dev/tty
         else
-            echo -e "${YELLOW}[Warn] 远程源尚未公开或未推送，跳过自动拉取固化，直接进入当前会话...${PLAIN}"
+            echo -e "${YELLOW}[Warn] 远程源尚未同步，直接进入当前交互会话...${PLAIN}"
         fi
     elif [ "$(realpath "$0" 2>/dev/null)" != "$SCRIPT_PATH" ]; then
         cp -f "$0" "$SCRIPT_PATH"
@@ -95,8 +95,22 @@ pause_return() {
     read -rp "按回车键返回主菜单 / Press Enter to return..." _ </dev/tty
 }
 
+# 保存首次安装前的系统原始 DNS 状态 (包含符号链接目标识别)
+save_orig_resolv() {
+    mkdir -p "$WORK_DIR" "$BACKUP_DIR"
+    if [ ! -f "${WORK_DIR}/resolv.conf.orig" ] && [ ! -f "${WORK_DIR}/resolv.symlink" ]; then
+        if [ -L /etc/resolv.conf ]; then
+            readlink /etc/resolv.conf > "${WORK_DIR}/resolv.symlink"
+        elif [ -f /etc/resolv.conf ]; then
+            cp -f /etc/resolv.conf "${WORK_DIR}/resolv.conf.orig"
+        fi
+    fi
+}
+
 # 自动备份轮转 (严格保留最新 3 份归档)
 backup_configs() {
+    mkdir -p "$WORK_DIR" "$BACKUP_DIR"
+    save_orig_resolv
     local ts tar_file files_to_bak=()
     ts=$(date +%Y%m%d_%H%M%S)
     tar_file="${BACKUP_DIR}/dns_bak_${ts}.tar.gz"
@@ -126,7 +140,6 @@ get_arch() {
     esac
 }
 
-# 下载或无损升级 dnsproxy 核心二进制
 install_binary() {
     local force_update="${1:-0}"
     if [ "$force_update" -eq 0 ] && [ -x "$BIN_PATH" ] && "$BIN_PATH" --version >/dev/null 2>&1; then
@@ -193,6 +206,7 @@ RES_EOF
 }
 
 write_doh_config() {
+    mkdir -p "$WORK_DIR"
     local mode="${1:-global}" custom_u1="$2" custom_u2="$3" dip
     dip=$(get_docker_ip)
 
@@ -340,7 +354,7 @@ SVC_EOF
     fi
 
     chattr -i /etc/resolv.conf 2>/dev/null
-    [ ! -f "${WORK_DIR}/resolv.conf.orig" ] && cp -L /etc/resolv.conf "${WORK_DIR}/resolv.conf.orig" 2>/dev/null
+    save_orig_resolv
     rm -f /etc/resolv.conf
     cat << 'R_EOF' > /etc/resolv.conf
 # Managed by Easy-DoH (TCP+UDP 53 -> DoH/DoT)
@@ -366,6 +380,7 @@ fix_docker_dns() {
     echo -e "${CYAN}  -> 检测到 Docker，正在注入网桥 DNS (${dip}) 防回退 8.8.8.8...${PLAIN}"
     backup_configs
     mkdir -p /etc/docker
+    echo "$dip" > "${WORK_DIR}/docker_ip.state"
 
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
         ufw allow in on docker0 to any port 53 >/dev/null 2>&1
@@ -413,6 +428,46 @@ PY_EOF
     fi
 }
 
+# 撤销 Docker 网桥 DNS 注入与防火墙规则
+revert_docker_dns() {
+    local dip=""
+    [ -f "${WORK_DIR}/docker_ip.state" ] && dip=$(cat "${WORK_DIR}/docker_ip.state")
+    [ -z "$dip" ] && dip=$(get_docker_ip)
+    [ -z "$dip" ] && dip="172.17.0.1"
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow in on docker0 to any port 53 >/dev/null 2>&1 || true
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        while iptables -D INPUT -i docker0 -p udp --dport 53 -j ACCEPT 2>/dev/null; do :; done
+        while iptables -D INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null; do :; done
+    fi
+
+    if [ -f "$DOCKER_DAEMON" ] && grep -q "$dip" "$DOCKER_DAEMON" 2>/dev/null; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "$DOCKER_DAEMON" "$dip" << 'PY_CLEAN'
+import json, sys, os
+path, dip = sys.argv[1], sys.argv[2]
+try:
+    with open(path, 'r') as f:
+        data = json.load(f)
+    if "dns" in data and dip in data["dns"]:
+        data["dns"] = [x for x in data["dns"] if x != dip]
+        if not data["dns"]:
+            del data["dns"]
+    if not data:
+        os.remove(path)
+    else:
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+except Exception:
+    pass
+PY_CLEAN
+        fi
+        command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker && systemctl restart docker 2>/dev/null || true
+    fi
+}
+
 enable_native_dot() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}启用系统原生 DoT 模式 / Native systemd-resolved DoT (Port 853)${PLAIN}"
@@ -441,7 +496,7 @@ DOT_EOF
     systemctl restart systemd-resolved
 
     chattr -i /etc/resolv.conf 2>/dev/null
-    [ ! -f "${WORK_DIR}/resolv.conf.orig" ] && cp -L /etc/resolv.conf "${WORK_DIR}/resolv.conf.orig" 2>/dev/null
+    save_orig_resolv
     ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
     echo -e "${GREEN}[OK] 系统原生 DoT (853 端口) 已成功接管！${PLAIN}"
@@ -657,12 +712,11 @@ audit_leaks() {
     echo -e "${DIV_BOLD}"
 }
 
-# 在线无损更新脚本与 dnsproxy 内核 (GitHub 主源 + Cloudflare 镜像兜底)
 update_self_and_core() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}在线无损更新 / Lossless Update (Script + dnsproxy Core)${PLAIN}"
     echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 仅更新管理脚本 (${GH_REPO}) [GitHub 主源 + CF 回退]"
+    echo -e "  ${GREEN}[1]${PLAIN} 仅更新管理脚本 (${GH_REPO}) [GitHub 主源 + CDN 回退]"
     echo -e "  ${GREEN}[2]${PLAIN} 仅更新 AdGuard dnsproxy 内核二进制 (平滑热重启)"
     echo -e "  ${GREEN}[3]${PLAIN} 同时更新管理脚本 + dnsproxy 内核"
     echo -e "${DIV_THIN}"
@@ -689,21 +743,71 @@ update_self_and_core() {
     fi
 }
 
-uninstall_all() {
-    local yn
-    read -rp "确认卸载 Easy-DoH 并恢复初始 DNS 吗？(Confirm uninstall?) [y/N]: " yn </dev/tty
-    [[ ! "$yn" =~ ^[Yy]$ ]] && return 0
+# 核心无痕清理执行器 (彻底还原配置 + 删除全部备份、日志、内核与残留文件)
+purge_core() {
+    local remove_self="${1:-0}"
 
-    systemctl stop easy-doh 2>/dev/null
-    systemctl disable easy-doh 2>/dev/null
-    rm -f "$SERVICE_FILE" /etc/systemd/resolved.conf.d/99-easy-doh.conf /etc/systemd/resolved.conf.d/99-native-dot.conf
+    echo -e "\n${CYAN}[1/4] 停止并移除加密 DNS 守护进程与历史日志...${PLAIN}"
+    systemctl stop easy-doh 2>/dev/null || true
+    systemctl disable easy-doh 2>/dev/null || true
+    systemctl stop doh-proxy 2>/dev/null || true
+    systemctl disable doh-proxy 2>/dev/null || true
+    rm -f "$SERVICE_FILE" /etc/systemd/system/doh-proxy.service /etc/default/doh-proxy
+    rm -f /etc/systemd/resolved.conf.d/99-easy-doh.conf \
+          /etc/systemd/resolved.conf.d/99-native-dot.conf \
+          /etc/systemd/resolved.conf.d/nodnsstub.conf
     systemctl daemon-reload
+    journalctl --vacuum-time=1s --unit=easy-doh >/dev/null 2>&1 || true
 
-    chattr -i /etc/resolv.conf 2>/dev/null
-    [ -f "${WORK_DIR}/resolv.conf.orig" ] && cp -f "${WORK_DIR}/resolv.conf.orig" /etc/resolv.conf
-    systemctl restart systemd-resolved 2>/dev/null
+    echo -e "${CYAN}[2/4] 恢复初始 /etc/resolv.conf 并解除防篡改锁...${PLAIN}"
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    if [ -f "${WORK_DIR}/resolv.symlink" ]; then
+        local sym_target
+        sym_target=$(cat "${WORK_DIR}/resolv.symlink")
+        rm -f /etc/resolv.conf
+        ln -sf "$sym_target" /etc/resolv.conf
+    elif [ -f "${WORK_DIR}/resolv.conf.orig" ]; then
+        rm -f /etc/resolv.conf
+        cp -f "${WORK_DIR}/resolv.conf.orig" /etc/resolv.conf
+    elif [ -f /etc/resolv.conf.doh.bak ]; then
+        mv -f /etc/resolv.conf.doh.bak /etc/resolv.conf
+    elif systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved"; then
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    fi
+    systemctl is-enabled --quiet systemd-resolved 2>/dev/null && systemctl restart systemd-resolved 2>/dev/null || true
 
-    echo -e "${GREEN}[OK] 已卸载并还原配置！(历史备份保留在 ${BACKUP_DIR})${PLAIN}"
+    echo -e "${CYAN}[3/4] 清理 Docker 网桥注入规则与防火墙策略...${PLAIN}"
+    revert_docker_dns
+
+    echo -e "${CYAN}[4/4] 彻底清空所有备份归档、缓存状态与二进制内核...${PLAIN}"
+    rm -rf "$WORK_DIR"
+    rm -f "$BIN_PATH" "${BIN_PATH}.new" /etc/resolv.conf.doh.bak /tmp/doh_bench_*
+
+    if [ "$remove_self" -eq 1 ]; then
+        rm -f "$SCRIPT_PATH" "${SCRIPT_PATH}.new" "${SCRIPT_PATH}.tmp"
+        echo -e "\n${GREEN}[OK] 已完成 100% 零残留彻底卸载（包含所有备份、内核与 doh 命令本身）！${PLAIN}\n"
+        exit 0
+    else
+        echo -e "\n${GREEN}[OK] 服务、内核与全部历史备份已彻底清空！(仅保留 doh 管理脚本)${PLAIN}"
+    fi
+}
+
+uninstall_all() {
+    echo -e "\n${DIV_BOLD}"
+    echo -e " ${CYAN}彻底卸载与无痕清理 / Complete Uninstall & Zero-Trace Purge${PLAIN}"
+    echo -e "${DIV_THIN}"
+    echo -e "  ${YELLOW}[1]${PLAIN} 卸载服务 + 还原 DNS + ${RED}清空所有备份与内核${PLAIN} (保留 doh 命令备用)"
+    echo -e "  ${RED}[2]${PLAIN} 100% 零残留彻底抹除 (${RED}连同 /usr/local/bin/doh 脚本一起自毁删除${PLAIN})"
+    echo -e "  ${GRAY}[0]${PLAIN} 取消返回 (Cancel)"
+    echo -e "${DIV_THIN}"
+    local u_mode
+    read -rp "请选择清理级别 / Select purge level [0-2]: " u_mode </dev/tty
+    u_mode=$(echo "$u_mode" | tr -d '[:space:]')
+    case "$u_mode" in
+        1) purge_core 0 ;;
+        2) purge_core 1 ;;
+        *) echo -e "${GRAY}已取消卸载操作。${PLAIN}" ;;
+    esac
 }
 
 render_menu() {
@@ -738,8 +842,8 @@ render_menu() {
         fi
     fi
 
-    local bak_cnt
-    bak_cnt=$(ls -1 "${BACKUP_DIR}"/dns_bak_*.tar.gz 2>/dev/null | wc -l)
+    local bak_cnt=0
+    [ -d "$BACKUP_DIR" ] && bak_cnt=$(ls -1 "${BACKUP_DIR}"/dns_bak_*.tar.gz 2>/dev/null | wc -l)
 
     clear
     echo -e "${DIV_BOLD}"
@@ -760,17 +864,20 @@ render_menu() {
     echo -e "  ${GREEN}[7]${PLAIN} 查看服务实时运行日志          (View Service Logs)"
     echo -e "  ${GREEN}[8]${PLAIN} 解锁 / 锁定 /etc/resolv.conf  (Toggle Resolv +i Lock)"
     echo -e "  ${GREEN}[9]${PLAIN} 在线无损更新脚本与内核        (Lossless Update Script & Core)"
-    echo -e "  ${GREEN}[10]${PLAIN} 卸载服务并还原备份           (Uninstall & Restore)"
+    echo -e "  ${GREEN}[10]${PLAIN} 彻底卸载并清空全部备份       (Complete Uninstall & Purge)"
     echo -e "  ${GREEN}[0]${PLAIN} 退出管理面板                  (Exit)"
     echo -e "${DIV_BOLD}"
 }
 
-# CLI 非交互自动化入口支持 (例如: doh --auto tw | doh --test | doh --audit)
+# CLI 非交互自动化入口支持 (doh --auto tw | doh --purge | doh --test | doh --audit)
 case "${1:-}" in
     --auto)
         cp -f "$0" "$SCRIPT_PATH" 2>/dev/null && chmod +x "$SCRIPT_PATH"
         run_deploy_core "${2:-global}" "" "" 1
         exit $?
+        ;;
+    --purge)
+        purge_core 1
         ;;
     --test)
         test_all_dns
@@ -818,3 +925,5 @@ while true; do
             ;;
     esac
 done
+EOF
+chmod +x /usr/local/bin/doh && doh
