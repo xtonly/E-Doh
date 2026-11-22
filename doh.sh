@@ -1,11 +1,11 @@
 cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
-# =============================================================================================
+# ========================================================================================
 # Project   : Easy-DoH Manager (v2.7 Release)
 # Author    : xtonly
 # Features  : Pure-IP Bootstrap DoH/DoT | Docker DNS Guard | Zero-Trace Purge
 # Usage     : Interactive -> doh | Unattended -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
-# =============================================================================================
+# ========================================================================================
 
 VERSION="2.7"
 GH_REPO="xtonly/Easy-DoH"
@@ -34,8 +34,8 @@ STATE_FILE="${WORK_DIR}/profile.state"
 SERVICE_FILE="/etc/systemd/system/easy-doh.service"
 DOCKER_DAEMON="/etc/docker/daemon.json"
 
-DIV_BOLD="${CYAN}=======================================================================================${PLAIN}"
-DIV_THIN="${GRAY}---------------------------------------------------------------------------------------${PLAIN}"
+DIV_BOLD="${CYAN}==================================================================================${PLAIN}"
+DIV_THIN="${GRAY}----------------------------------------------------------------------------------${PLAIN}"
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[Error] 请使用 root 权限运行 (Please run as root: sudo doh)${PLAIN}"
