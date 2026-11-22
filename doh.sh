@@ -1,17 +1,17 @@
+cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
 # ==============================================================================
-# Project   : E-Doh Manager (v3.2 Release)
+# Project   : E-Doh Manager (v3.3 Release)
 # Repo      : https://github.com/xtonly/E-Doh
-# Features  : Dead-Node Auto-Prune | Zero-Python Docker Guard | Zero-Trace Purge
+# Features  : Split-DNS for ISP API (100.100.101.x) | Auto-Prune | Docker Guard
 # Usage     : Interactive -> doh | CLI -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
 # ==============================================================================
 
-VERSION="3.2"
+VERSION="3.3"
 GH_REPO="xtonly/E-Doh"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
 
-# 多源回退链：GitHub Raw 主源优先 -> Cloudflare CDN 次选 -> Fastly / Global jsDelivr 兜底
 RAW_URLS=(
     "https://raw.githubusercontent.com/${GH_REPO}/refs/heads/${GH_BRANCH}/doh.sh"
     "https://testingcf.jsdelivr.net/gh/${GH_REPO}@${GH_BRANCH}/doh.sh"
@@ -31,10 +31,10 @@ BACKUP_DIR="${WORK_DIR}/backups"
 BIN_PATH="/usr/local/bin/dnsproxy"
 CONF_FILE="${WORK_DIR}/config.yaml"
 STATE_FILE="${WORK_DIR}/profile.state"
+SPLIT_CONF="${WORK_DIR}/split_dns.conf"
 SERVICE_FILE="/etc/systemd/system/easy-doh.service"
 DOCKER_DAEMON="/etc/docker/daemon.json"
 
-# 标准 RFC 8484 Wireformat 查询串 (example.com IN A)
 Q_WIRE="AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
 
 DIV_BOLD="${CYAN}========================================================================${PLAIN}"
@@ -164,6 +164,7 @@ backup_configs() {
     [ -f /etc/resolv.conf ] && files_to_bak+=("/etc/resolv.conf")
     [ -f "$DOCKER_DAEMON" ] && files_to_bak+=("$DOCKER_DAEMON")
     [ -f "$CONF_FILE" ] && files_to_bak+=("$CONF_FILE")
+    [ -f "$SPLIT_CONF" ] && files_to_bak+=("$SPLIT_CONF")
 
     if [ ${#files_to_bak[@]} -gt 0 ]; then
         tar -czf "$tar_file" "${files_to_bak[@]}" 2>/dev/null
@@ -255,6 +256,33 @@ RES_EOF
             sleep 1
         fi
     fi
+}
+
+# 将 /etc/easy-doh/split_dns.conf 中的私有域名分流规则挂载进 config.yaml
+inject_split_rules_to_yaml() {
+    [ ! -s "$SPLIT_CONF" ] || [ ! -f "$CONF_FILE" ] && return 0
+    # 先清理旧的注入行 (以 "[/" 开头的上游规则)，再重新注入最新规则
+    sed -i '/"\[\/.*\/\]/d' "$CONF_FILE"
+    while IFS='|' read -r dom_str dns_ips; do
+        [ -z "$dom_str" ] || [ -z "$dns_ips" ] && continue
+        local spec_path="" d ip
+        IFS=',' read -ra d_arr <<< "$dom_str"
+        for d in "${d_arr[@]}"; do
+            d=$(echo "$d" | tr -d '[:space:]')
+            # 若用户输入了完整 URL (如 http://api.xxx.com/ip)，自动剥离提取纯域名
+            d=$(echo "$d" | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##')
+            [ -n "$d" ] && spec_path="${spec_path}${d}/"
+        done
+        [ -z "$spec_path" ] && continue
+
+        IFS=',' read -ra ip_arr <<< "$dns_ips"
+        for ip in "${ip_arr[@]}"; do
+            ip=$(echo "$ip" | tr -d '[:space:]')
+            [ -z "$ip" ] && continue
+            [[ "$ip" != *:* ]] && ip="${ip}:53"
+            sed -i "/^upstream:/a \  - \"[/${spec_path}]${ip}\"" "$CONF_FILE"
+        done
+    done < "$SPLIT_CONF"
 }
 
 write_doh_config() {
@@ -381,7 +409,7 @@ write_doh_config() {
     echo -e "${GREEN}  -> 已启用存活节点: ${joined_names} (Bootstrap: ${boot_ip})${PLAIN}"
 
     cat << YAML_EOF > "$CONF_FILE"
-# E-Doh Config v${VERSION} (Auto-Pruned Healthy Upstreams)
+# E-Doh Config v${VERSION} (Auto-Pruned Healthy Upstreams + Split-DNS)
 listen-addrs:
   - "127.0.0.1"
 YAML_EOF
@@ -409,6 +437,110 @@ fallback:
   - "https://${boot_ip}/dns-query"
   - "tls://${boot_ip}:853"
 YAML_FB
+
+    # 自动挂载已保存的商家内网专属分流规则 (如 100.100.101.101/102)
+    inject_split_rules_to_yaml
+}
+
+# 商家内网 DNS 分流管理模块 (专为 TW HiNet/Seednet 100.100.101.101/102 动态换 IP API 设计)
+manage_split_dns() {
+    mkdir -p "$WORK_DIR"
+    echo -e "\n${DIV_BOLD}"
+    echo -e " ${CYAN}商家内网私有 DNS 分流 / ISP Split-DNS (TW HiNet/Seednet 换 IP 专用)${PLAIN}"
+    echo -e "${DIV_THIN}"
+    echo -e " ${GRAY}原理：仅将指定的商家换 IP API 域名定向至内网 100.100.101.101/102 解析，${PLAIN}"
+    echo -e " ${GRAY}其余所有正常上网流量依然 100% 走加密 DoH，彻底解决换 IP 失败且不漏请求！${PLAIN}"
+    echo -e "${DIV_THIN}"
+
+    if [ -s "$SPLIT_CONF" ]; then
+        echo -e "  ${GREEN}当前已生效的分流规则 (Active Split Rules):${PLAIN}"
+        local idx=0
+        while IFS='|' read -r d_list i_list; do
+            idx=$((idx + 1))
+            echo -e "    #${idx}: 域名 [${YELLOW}${d_list}${PLAIN}] -> 内网 DNS [${CYAN}${i_list}${PLAIN}]"
+        done < "$SPLIT_CONF"
+    else
+        echo -e "  ${GRAY}当前暂未配置内网分流规则 (No split rules configured).${PLAIN}"
+    fi
+
+    # 自动扫描本机 crontab 或脚本中可能存在的换 IP API 域名提示给用户
+    local hints
+    hints=$(grep -rhEo 'https?://[a-zA-Z0-9._-]+' /etc/crontab /etc/cron* /var/spool/cron/ /root/*.sh /opt/*.sh 2>/dev/null \
+        | sed -E 's#^https?://##' | grep -vE '^(raw\.githubusercontent\.com|api\.github\.com|github\.com|1\.1\.1\.1|8\.8\.8\.8|deb\.debian\.org|security\.debian\.org|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$' \
+        | sort -u | paste -sd ", " - || true)
+    [ -n "$hints" ] && echo -e "  ${GRAY}本机定时任务/脚本发现的候选域名: ${YELLOW}${hints}${PLAIN}"
+
+    echo -e "${DIV_THIN}"
+    echo -e "  ${GREEN}[1]${PLAIN} 添加 / 更新 TW 商家内网 DNS 分流规则 (默认 DNS: 100.100.101.101,100.100.101.102)"
+    echo -e "  ${YELLOW}[2]${PLAIN} 测试内网 DNS (100.100.101.101) 连通性与解析结果"
+    echo -e "  ${RED}[3]${PLAIN} 清空所有内网私有分流规则"
+    echo -e "  ${GRAY}[0]${PLAIN} 返回主菜单"
+    echo -e "${DIV_THIN}"
+    local s_opt
+    read -rp "请选择操作 [0-3]: " s_opt </dev/tty
+    s_opt=$(echo "$s_opt" | tr -d '[:space:]')
+
+    case "$s_opt" in
+        1)
+            echo ""
+            read -rp "  1) 请输入换 IP API 域名或后缀 (多个用逗号隔开，如 api.xxx.com,lan): " in_doms </dev/tty
+            in_doms=$(echo "$in_doms" | tr -d '[:space:]')
+            if [ -z "$in_doms" ]; then
+                echo -e "${RED}  [Warn] 域名不能为空，如果不知道域名，请先查看你的换 IP 链接 URL！${PLAIN}"
+                return 1
+            fi
+            read -rp "  2) 请输入内网 DNS [回车默认 100.100.101.101,100.100.101.102]: " in_ips </dev/tty
+            in_ips=$(echo "$in_ips" | tr -d '[:space:]')
+            [ -z "$in_ips" ] && in_ips="100.100.101.101,100.100.101.102"
+
+            backup_configs
+            echo "${in_doms}|${in_ips}" > "$SPLIT_CONF"
+            if [ -f "$CONF_FILE" ]; then
+                inject_split_rules_to_yaml
+                systemctl is-active --quiet easy-doh && systemctl restart easy-doh
+                echo -e "\n${GREEN}  [OK] 分流规则已注入并热重启生效！正在实测分流域名解析...${PLAIN}"
+                local first_dom
+                first_dom=$(echo "${in_doms%%,*}" | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##')
+                local test_ip
+                test_ip=$(getent ahostsv4 "$first_dom" 2>/dev/null | awk '{print $1}' | head -n1)
+                if [ -n "$test_ip" ]; then
+                    echo -e "  ${GREEN}-> 实测成功: ${first_dom} -> ${test_ip}${PLAIN}"
+                else
+                    echo -e "  ${YELLOW}-> 提示: 若您填的是根后缀 (如 local)，请用完整 API 子域名实测。${PLAIN}"
+                fi
+            else
+                echo -e "\n${YELLOW}  [OK] 规则已保存！请接着执行主菜单 [1] 启动 DoH 服务即可自动生效。${PLAIN}"
+            fi
+            ;;
+        2)
+            local t_dom t_dns="100.100.101.101"
+            read -rp "  请输入要向 100.100.101.101 测试查询的 API 域名: " t_dom </dev/tty
+            t_dom=$(echo "$t_dom" | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##' | tr -d '[:space:]')
+            [ -z "$t_dom" ] && return 0
+            echo -e "${CYAN}  -> 正在直连 @100.100.101.101 与 @100.100.101.102 查询 ${t_dom} ...${PLAIN}"
+            for tip in 100.100.101.101 100.100.101.102; do
+                local ans=""
+                if command -v dig >/dev/null 2>&1; then
+                    ans=$(dig +short +time=2 +tries=1 @"${tip}" "$t_dom" A 2>/dev/null | paste -sd "," -)
+                elif command -v nslookup >/dev/null 2>&1; then
+                    ans=$(nslookup "$t_dom" "$tip" 2>/dev/null | awk '/^Address: / {print $2}' | paste -sd "," -)
+                fi
+                if [ -n "$ans" ]; then
+                    echo -e "    ${GREEN}[OK]${PLAIN} @${tip}:53 -> ${GREEN}${ans}${PLAIN}"
+                else
+                    echo -e "    ${RED}[FAIL]${PLAIN} @${tip}:53 -> 无返回或超时"
+                fi
+            done
+            ;;
+        3)
+            rm -f "$SPLIT_CONF"
+            if [ -f "$CONF_FILE" ]; then
+                sed -i '/"\[\/.*\/\]/d' "$CONF_FILE"
+                systemctl is-active --quiet easy-doh && systemctl restart easy-doh
+            fi
+            echo -e "\n${GREEN}  [OK] 已清空所有内网私有 DNS 分流规则！${PLAIN}"
+            ;;
+    esac
 }
 
 activate_doh_service() {
@@ -435,7 +567,7 @@ SVC_EOF
     sleep 1
 
     if ! systemctl is-active --quiet easy-doh; then
-        echo -e "${RED}[Error] 服务启动失败，请按 [7] 查看运行日志！${PLAIN}"
+        echo -e "${RED}[Error] 服务启动失败，请按 [8] 查看运行日志！${PLAIN}"
         return 1
     fi
 
@@ -452,7 +584,6 @@ R_EOF
     return 0
 }
 
-# 免 Python3 原生兼容的 Docker 网桥 DNS 守护器 (已配置时幂等秒过，绝不误报黄字)
 fix_docker_dns() {
     local silent_mode="${1:-0}"
     if ! command -v docker >/dev/null 2>&1; then
@@ -467,7 +598,6 @@ fix_docker_dns() {
     mkdir -p /etc/docker "$WORK_DIR"
     echo "$dip" > "${WORK_DIR}/docker_ip.state"
 
-    # 确保防火墙放行 docker0 -> 53
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
         ufw allow in on docker0 to any port 53 >/dev/null 2>&1
     fi
@@ -476,13 +606,11 @@ fix_docker_dns() {
         iptables -C INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
     fi
 
-    # 确保 dnsproxy 监听列表包含 docker0 网关
     if [ -f "$CONF_FILE" ] && ! grep -q "$dip" "$CONF_FILE"; then
         sed -i "/listen-addrs:/a \  - \"${dip}\"" "$CONF_FILE"
         systemctl restart easy-doh
     fi
 
-    # 幂等检查：如果 daemon.json 已经写好了该网桥 IP 且无残留明文 8.8.8.8，直接绿灯通过！
     if [ -s "$DOCKER_DAEMON" ] && grep -q "\"${dip}\"" "$DOCKER_DAEMON" 2>/dev/null && ! grep -qE '"(8\.8\.8\.8|8\.8\.4\.4|1\.1\.1\.1)"' "$DOCKER_DAEMON" 2>/dev/null; then
         echo -e "${GREEN}  -> Docker 容器网桥 DNS (${dip}:53) 已处于受保护状态，无需重复修改！${PLAIN}"
         return 0
@@ -491,7 +619,6 @@ fix_docker_dns() {
     echo -e "${CYAN}  -> 检测到 Docker，正在注入网桥 DNS (${dip}) 防回退 8.8.8.8...${PLAIN}"
     backup_configs
 
-    # 三级无损 JSON 写入器：空文件直接写 -> jq -> python3 -> 纯 sed 注入
     if [ ! -s "$DOCKER_DAEMON" ] || [ "$(tr -d '[:space:]' < "$DOCKER_DAEMON")" = "{}" ]; then
         printf '{\n  "dns": ["%s"]\n}\n' "$dip" > "$DOCKER_DAEMON"
         need_restart=1
@@ -521,7 +648,6 @@ with open(path, 'w') as f:
 PY_EOF
         need_restart=1
     elif ! grep -q '"dns"' "$DOCKER_DAEMON" 2>/dev/null; then
-        # 纯 Shell 注入：若原 JSON 没有 "dns" 键，直接在首个 '{' 后插入
         sed -i "0,/{/s/{/{\n  \"dns\": [\"${dip}\"],/" "$DOCKER_DAEMON"
         need_restart=1
     else
@@ -824,9 +950,9 @@ audit_leaks() {
 
     echo -e "\n ${YELLOW}[3] 实时外部 53 端口连接抓捕 (Live Outbound Port 53 Sockets):${PLAIN}"
     local live_53
-    live_53=$(ss -tunap 2>/dev/null | awk '$5 ~ /:53$/ && $5 !~ /127\.0\.0\.|172\.17\.0\.1|\*:53|0\.0\.0\.0:53|\[::\]:53/' || true)
+    live_53=$(ss -tunap 2>/dev/null | awk '$5 ~ /:53$/ && $5 !~ /127\.0\.0\.|172\.17\.0\.1|100\.100\.101\.|\*:53|0\.0\.0\.0:53|\[::\]:53/' || true)
     if [ -z "$live_53" ]; then
-        echo -e "     ${GREEN}[OK] 完美！当前没有任何进程向外部 53 端口发起连接。${PLAIN}"
+        echo -e "     ${GREEN}[OK] 完美！当前没有任何进程向公网 53 端口发起连接。${PLAIN}"
     else
         echo -e "${RED}${live_53}${PLAIN}" | sed 's/^/     /'
     fi
@@ -928,7 +1054,7 @@ purge_core() {
     echo -e "${CYAN}[3/4] 清理 Docker 网桥注入规则与防火墙策略...${PLAIN}"
     revert_docker_dns
 
-    echo -e "${CYAN}[4/4] 彻底清空所有备份归档、缓存状态与二进制内核...${PLAIN}"
+    echo -e "${CYAN}[4/4] 彻底清空所有备份归档、分流规则与二进制内核...${PLAIN}"
     rm -rf "$WORK_DIR"
     rm -f "$BIN_PATH" "${BIN_PATH}.new" /etc/resolv.conf.doh.bak /tmp/doh_bench_*
 
@@ -977,6 +1103,13 @@ render_menu() {
         listen_str="127.0.0.53:53 (TCP + UDP)"
     fi
 
+    local split_str="${GRAY}Disabled (未启用)${PLAIN}"
+    if [ -s "$SPLIT_CONF" ]; then
+        local s_dom s_ip
+        IFS='|' read -r s_dom s_ip < "$SPLIT_CONF"
+        split_str="${GREEN}[/${s_dom}/] -> ${s_ip}${PLAIN}"
+    fi
+
     local lock_str="${YELLOW}Unlocked (未锁定)${PLAIN}"
     lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i' && lock_str="${GREEN}Locked +i (防篡改已锁)${PLAIN}"
 
@@ -987,7 +1120,7 @@ render_menu() {
         if grep -q "${dip:-172.17.0.1}" "$DOCKER_DAEMON" 2>/dev/null; then
             dk_str="${GREEN}Protected (${dip:-172.17.0.1}:53)${PLAIN}"
         else
-            dk_str="${YELLOW}Unconfigured (建议执行 [3] 接管)${PLAIN}"
+            dk_str="${YELLOW}Unconfigured (建议执行 [4] 接管)${PLAIN}"
         fi
     fi
 
@@ -1001,28 +1134,39 @@ render_menu() {
     echo -e "  运行状态 Engine   : ${eng_str}"
     echo -e "  监听端点 Listen   : ${listen_str}"
     echo -e "  上游策略 Upstream : ${CYAN}${up_str}${PLAIN}"
+    echo -e "  内网分流 SplitDNS : ${split_str}"
     echo -e "  系统锁定 Resolv   : ${lock_str}  [备份 Backups: ${bak_cnt}/3]"
     echo -e "  容器环境 Docker   : ${dk_str}"
     echo -e "${DIV_THIN}"
     echo -e "  ${GREEN}[1]${PLAIN} 安装 / 切换分地区 DoH 策略    (Install / Switch Regional DoH)"
     echo -e "  ${GREEN}[2]${PLAIN} 启用系统原生 DoT 急救模式     (Enable Native DoT 853)"
-    echo -e "  ${GREEN}[3]${PLAIN} 修复 Docker 容器 DNS 防回退   (Fix Docker Bridge DNS)"
-    echo -e "  ${GREEN}[4]${PLAIN} 实测本地 DNS 解析 (IPv4/IPv6) (Test Local DNS Resolution)"
-    echo -e "  ${GREEN}[5]${PLAIN} 全球 12 大 DoH 并发测速排行   (Global DoH Upstream Speedtest)"
-    echo -e "  ${GREEN}[6]${PLAIN} 全盘扫描 53 端口漏网之鱼      (Audit Port 53 Leaks)"
-    echo -e "  ${GREEN}[7]${PLAIN} 查看当前实例运行日志          (View Current Instance Logs)"
-    echo -e "  ${GREEN}[8]${PLAIN} 解锁 / 锁定 /etc/resolv.conf  (Toggle Resolv +i Lock)"
-    echo -e "  ${GREEN}[9]${PLAIN} 在线无损更新脚本与内核        (Lossless Update Script & Core)"
-    echo -e "  ${GREEN}[10]${PLAIN} 彻底卸载并清空全部备份       (Complete Uninstall & Purge)"
+    echo -e "  ${GREEN}[3]${PLAIN} 商家内网 DNS 分流 (TW换IP专用)(ISP Split-DNS 100.100.101.x)"
+    echo -e "  ${GREEN}[4]${PLAIN} 修复 Docker 容器 DNS 防回退   (Fix Docker Bridge DNS)"
+    echo -e "  ${GREEN}[5]${PLAIN} 实测本地 DNS 解析 (IPv4/IPv6) (Test Local DNS Resolution)"
+    echo -e "  ${GREEN}[6]${PLAIN} 全球 12 大 DoH 并发测速排行   (Global DoH Upstream Speedtest)"
+    echo -e "  ${GREEN}[7]${PLAIN} 全盘扫描 53 端口漏网之鱼      (Audit Port 53 Leaks)"
+    echo -e "  ${GREEN}[8]${PLAIN} 查看当前实例运行日志          (View Current Instance Logs)"
+    echo -e "  ${GREEN}[9]${PLAIN} 解锁 / 锁定 /etc/resolv.conf  (Toggle Resolv +i Lock)"
+    echo -e "  ${GREEN}[10]${PLAIN} 在线无损更新脚本与内核       (Lossless Update Script & Core)"
+    echo -e "  ${GREEN}[11]${PLAIN} 彻底卸载并清空全部备份       (Complete Uninstall & Purge)"
     echo -e "  ${GREEN}[0]${PLAIN} 退出管理面板                  (Exit)"
     echo -e "${DIV_BOLD}"
 }
 
+# CLI 非交互自动化支持: doh --split "api.xxx.com" "100.100.101.101,100.100.101.102"
 case "${1:-}" in
     --auto)
         cp -f "$0" "$SCRIPT_PATH" 2>/dev/null && chmod +x "$SCRIPT_PATH"
         run_deploy_core "${2:-global}" "" "" 1
         exit $?
+        ;;
+    --split)
+        mkdir -p "$WORK_DIR"
+        [ -n "${2:-}" ] && echo "${2}|${3:-100.100.101.101,100.100.101.102}" > "$SPLIT_CONF"
+        inject_split_rules_to_yaml
+        systemctl is-active --quiet easy-doh && systemctl restart easy-doh
+        echo "[OK] Split-DNS rule applied: [/${2}/] -> ${3:-100.100.101.101,100.100.101.102}"
+        exit 0
         ;;
     --purge)
         purge_core 1
@@ -1042,19 +1186,20 @@ read -t 0.1 -n 10000 _discard 2>/dev/null || true
 
 while true; do
     render_menu
-    read -rp "请输入选项编号 / Select option [0-10]: " choice </dev/tty
+    read -rp "请输入选项编号 / Select option [0-11]: " choice </dev/tty
     choice=$(echo "$choice" | tr -d '[:space:]')
     [ -z "$choice" ] && continue
 
     case "$choice" in
         1) deploy_doh_wizard; pause_return ;;
         2) enable_native_dot; pause_return ;;
-        3) fix_docker_dns 0; pause_return ;;
-        4) test_all_dns; pause_return ;;
-        5) benchmark_global_upstreams; pause_return ;;
-        6) audit_leaks; pause_return ;;
-        7) show_live_logs; pause_return ;;
-        8)
+        3) manage_split_dns; pause_return ;;
+        4) fix_docker_dns 0; pause_return ;;
+        5) test_all_dns; pause_return ;;
+        6) benchmark_global_upstreams; pause_return ;;
+        7) audit_leaks; pause_return ;;
+        8) show_live_logs; pause_return ;;
+        9)
             if lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
                 chattr -i /etc/resolv.conf
                 echo -e "\n${YELLOW}[OK] 已解锁 /etc/resolv.conf (Unlocked).${PLAIN}"
@@ -1064,12 +1209,14 @@ while true; do
             fi
             pause_return
             ;;
-        9) update_self_and_core; pause_return ;;
-        10) uninstall_all; pause_return ;;
+        10) update_self_and_core; pause_return ;;
+        11) uninstall_all; pause_return ;;
         0) echo ""; exit 0 ;;
         *)
-            echo -e "\n${RED}[Warn] 无效选项 '${choice}'，请输入 0-10 之间的数字！${PLAIN}"
+            echo -e "\n${RED}[Warn] 无效选项 '${choice}'，请输入 0-11 之间的数字！${PLAIN}"
             sleep 1
             ;;
     esac
 done
+EOF
+chmod +x /usr/local/bin/doh && doh
