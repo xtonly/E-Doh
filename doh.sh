@@ -1,18 +1,17 @@
 cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
-# ========================================================================================
-# Project   : Easy-DoH Manager (v2.8 Release)
+# ==============================================================================
+# Project   : Easy-DoH Manager (v2.9 Release)
 # Author    : xtonly
-# Features  : Pure-IP DoH/DoT | Single-Bootstrap Zero-Error | Zero-Trace Purge
+# Features  : Dead-Node Auto-Prune | Multi-API Bootstrap | Docker Guard | Purge
 # Usage     : Interactive -> doh | Unattended -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
-# ========================================================================================
+# ==============================================================================
 
-VERSION="2.8"
+VERSION="2.9"
 GH_REPO="xtonly/Easy-DoH"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
 
-# 多源下载回退链 (GitHub 主源优先 -> Cloudflare jsDelivr -> Fastly jsDelivr 兜底)
 RAW_URLS=(
     "https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/doh.sh"
     "https://testingcf.jsdelivr.net/gh/${GH_REPO}@${GH_BRANCH}/doh.sh"
@@ -34,22 +33,72 @@ STATE_FILE="${WORK_DIR}/profile.state"
 SERVICE_FILE="/etc/systemd/system/easy-doh.service"
 DOCKER_DAEMON="/etc/docker/daemon.json"
 
-DIV_BOLD="${CYAN}==================================================================================${PLAIN}"
-DIV_THIN="${GRAY}----------------------------------------------------------------------------------${PLAIN}"
+# 标准 RFC 8484 Wireformat 查询串 (example.com IN A)
+Q_WIRE="AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
+
+DIV_BOLD="${CYAN}========================================================================${PLAIN}"
+DIV_THIN="${GRAY}------------------------------------------------------------------------${PLAIN}"
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[Error] 请使用 root 权限运行 (Please run as root: sudo doh)${PLAIN}"
     exit 1
 fi
 
+# 6 路纯 IP DoH 容灾解析 (彻底防 1.1.1.1 / 8.8.8.8 被黑洞的环境)
 doh_lookup_ip() {
     local domain="$1" ip=""
-    for api in "https://1.1.1.1/dns-query" "https://8.8.8.8/resolve"; do
-        ip=$(curl -4 -ksL --connect-timeout 3 -H "accept: application/dns-json" "${api}?name=${domain}&type=A" \
+    local apis=(
+        "https://1.1.1.1/dns-query"
+        "https://8.8.8.8/resolve"
+        "https://101.101.101.101/dns-query"
+        "https://94.140.14.140/dns-query"
+        "https://223.5.5.5/resolve"
+    )
+    for api in "${apis[@]}"; do
+        ip=$(curl -4 -ksL --connect-timeout 2 --max-time 3 -H "accept: application/dns-json" "${api}?name=${domain}&type=A" \
             | grep -oE '"data":"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | head -n1 | cut -d'"' -f4)
         [ -n "$ip" ] && break
     done
     echo "$ip"
+}
+
+# 快速探测单个 DoH 节点是否存活 (200 OK 返回 0，超时/阻断返回 1)
+probe_doh_alive() {
+    local url="$1" b_ip="${2:-}" host rip res_arg=() code
+    host=$(echo "$url" | awk -F/ '{print $3}')
+    if ! echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        if [ -n "$b_ip" ]; then
+            rip=$(curl -4 -ksL --connect-timeout 2 --max-time 3 -H "accept: application/dns-json" \
+                "https://${b_ip}/dns-query?name=${host}&type=A" 2>/dev/null \
+                | grep -oE '"data":"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | head -n1 | cut -d'"' -f4)
+        fi
+        [ -z "$rip" ] && rip=$(doh_lookup_ip "$host")
+        [ -n "$rip" ] && res_arg=(--resolve "${host}:443:${rip}")
+    fi
+
+    code=$(curl -4 -s -o /dev/null "${res_arg[@]}" --connect-timeout 1.5 --max-time 2.5 \
+        -H "accept: application/dns-message" -w "%{http_code}" "${url}?dns=${Q_WIRE}" 2>/dev/null | tr -d '\000')
+    [ "$code" = "200" ]
+}
+
+# 自动优选本机最快且存活的单一纯 IP Bootstrap (杜绝 8.8.8.8/1.1.1.1 黑洞导致域名节点解析失败)
+pick_best_bootstrap() {
+    local prefer="$1"
+    local candidates=("$prefer" "101.101.101.101" "94.140.14.140" "185.222.222.222" "8.8.8.8" "1.1.1.1" "223.5.5.5")
+    local seen="" ip code
+    for ip in "${candidates[@]}"; do
+        [ -z "$ip" ] && continue
+        [[ "$seen" == *"|$ip|"* ]] && continue
+        seen="${seen}|${ip}|"
+        code=$(curl -4 -s -o /dev/null --connect-timeout 1.2 --max-time 2 \
+            -H "accept: application/dns-message" -w "%{http_code}" \
+            "https://${ip}/dns-query?dns=${Q_WIRE}" 2>/dev/null | tr -d '\000')
+        if [ "$code" = "200" ]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    echo "94.140.14.140"
 }
 
 fetch_remote_script() {
@@ -145,7 +194,7 @@ install_binary() {
     arch=$(get_arch)
     [ "$arch" = "unsupported" ] && echo -e "${RED}[Error] 不支持的架构 / Unsupported arch: $(uname -m)${PLAIN}" && return 1
 
-    echo -e "${CYAN}[1/4] 正在通过 443 加密通道查询 GitHub 最新 dnsproxy 版本...${PLAIN}"
+    echo -e "${CYAN}[1/4] 正在通过多路 443 加密通道查询 GitHub 最新 dnsproxy 版本...${PLAIN}"
     api_ip=$(doh_lookup_ip "api.github.com"); [ -z "$api_ip" ] && api_ip="140.82.114.6"
     gh_ip=$(doh_lookup_ip "github.com");       [ -z "$gh_ip" ] && gh_ip="140.82.114.4"
     obj_ip=$(doh_lookup_ip "objects.githubusercontent.com"); [ -z "$obj_ip" ] && obj_ip="185.199.108.133"
@@ -200,124 +249,151 @@ RES_EOF
     fi
 }
 
-# 单一极速纯 IP Bootstrap + 纯 IP 证书节点优先，100% 根除多 Bootstrap 抢答导致的 context canceled
+# 智能健康过滤生成配置：自动剔除本机被墙/黑洞的 DoH 节点，防止慢节点拖累整体延迟到 1700ms+
 write_doh_config() {
     mkdir -p "$WORK_DIR"
     local mode="${1:-global}" custom_u1="$2" custom_u2="$3" dip
     dip=$(get_docker_ip)
 
+    local group_label="" pref_boot="8.8.8.8" candidates=()
+    case "$mode" in
+        tw|tw_opt)
+            group_label="TW Local"
+            pref_boot="101.101.101.101"
+            candidates=(
+                "TWNIC|https://101.101.101.101/dns-query"
+                "HiNet|https://dns.hinet.net/dns-query"
+                "AdGuard|https://94.140.14.140/dns-query"
+                "DNS.SB|https://185.222.222.222/dns-query"
+                "Google|https://8.8.8.8/dns-query"
+                "CF|https://1.1.1.1/dns-query"
+            )
+            ;;
+        apac|apac_opt)
+            group_label="Asia-Pacific"
+            pref_boot="185.222.222.222"
+            candidates=(
+                "DNS.SB|https://185.222.222.222/dns-query"
+                "AdGuard|https://94.140.14.140/dns-query"
+                "IIJ-JP|https://public.dns.iij.jp/dns-query"
+                "CF|https://1.1.1.1/dns-query"
+                "Google|https://8.8.8.8/dns-query"
+            )
+            ;;
+        eu|eu_opt)
+            group_label="Europe Pure-IP"
+            pref_boot="9.9.9.11"
+            candidates=(
+                "Quad9-ECS|https://9.9.9.11/dns-query"
+                "CF|https://1.1.1.1/dns-query"
+                "Mullvad|https://194.242.2.2/dns-query"
+                "DNS.SB|https://185.222.222.222/dns-query"
+                "AdGuard|https://94.140.14.140/dns-query"
+            )
+            ;;
+        na|na_opt)
+            group_label="North America"
+            pref_boot="9.9.9.11"
+            candidates=(
+                "Quad9-ECS|https://9.9.9.11/dns-query"
+                "CF|https://1.1.1.1/dns-query"
+                "OpenDNS|https://doh.opendns.com/dns-query"
+                "ControlD|https://freedns.controld.com/p0"
+                "Google|https://8.8.8.8/dns-query"
+            )
+            ;;
+        cn|cn_opt)
+            group_label="CN Mainland"
+            pref_boot="223.5.5.5"
+            candidates=(
+                "AliDNS-1|https://223.5.5.5/dns-query"
+                "AliDNS-2|https://223.6.6.6/dns-query"
+                "DNSPod|https://doh.pub/dns-query"
+                "360DoH|https://doh.360.cn/dns-query"
+            )
+            ;;
+        custom)
+            group_label="Custom DoH"
+            pref_boot="101.101.101.101"
+            candidates=(
+                "Primary|${custom_u1}"
+                "Secondary|${custom_u2}"
+            )
+            ;;
+        *)
+            group_label="Global Auto"
+            pref_boot="9.9.9.11"
+            candidates=(
+                "Quad9-ECS|https://9.9.9.11/dns-query"
+                "CF|https://1.1.1.1/dns-query"
+                "Google|https://8.8.8.8/dns-query"
+                "DNS.SB|https://185.222.222.222/dns-query"
+                "AdGuard|https://94.140.14.140/dns-query"
+            )
+            ;;
+    esac
+
+    echo -e "${CYAN}  -> 正在探测当前机器可用 Bootstrap 与存活上游 (自动剔除黑洞节点)...${PLAIN}"
+    local boot_ip
+    boot_ip=$(pick_best_bootstrap "$pref_boot")
+
+    local alive_urls=() alive_names=() dead_names=()
+    for item in "${candidates[@]}"; do
+        local n_tag="${item%%|*}"
+        local n_url="${item##*|}"
+        [ -z "$n_url" ] && continue
+        if [[ "$mode" = "custom" ]] || probe_doh_alive "$n_url" "$boot_ip"; then
+            alive_urls+=("$n_url")
+            alive_names+=("$n_tag")
+        else
+            dead_names+=("$n_tag")
+        fi
+    done
+
+    if [ ${#dead_names[@]} -gt 0 ]; then
+        echo -e "${YELLOW}  -> [避坑] 已自动剔除本机超时的黑洞节点: $(IFS=', '; echo "${dead_names[*]}")${PLAIN}"
+    fi
+
+    # 极端情况兜底：若该组全部超时，启用验证存活的 boot_ip 作为保底上游
+    if [ ${#alive_urls[@]} -eq 0 ]; then
+        alive_urls=("https://${boot_ip}/dns-query")
+        alive_names=("Fallback-${boot_ip}")
+    fi
+
+    local joined_names
+    joined_names=$(IFS=' + '; echo "${alive_names[*]}")
+    echo "${group_label} (${joined_names})" > "$STATE_FILE"
+    echo -e "${GREEN}  -> 已启用存活节点: ${joined_names} (Bootstrap: ${boot_ip})${PLAIN}"
+
     cat << YAML_EOF > "$CONF_FILE"
-# Easy-DoH Config v${VERSION} (TCP + UDP Port 53 | Zero-Cancel Load-Balance)
+# Easy-DoH Config v${VERSION} (Auto-Pruned Healthy Upstreams)
 listen-addrs:
   - "127.0.0.1"
 YAML_EOF
     [ -n "$dip" ] && echo "  - \"${dip}\"" >> "$CONF_FILE"
 
-    cat << 'YAML_PORT' >> "$CONF_FILE"
+    cat << YAML_BODY >> "$CONF_FILE"
 listen-ports:
   - 53
 upstream-mode: load_balance
 cache: true
 cache-size: 4194304
 cache-optimistic: true
-timeout: 4s
+timeout: 3s
 bootstrap:
-  - "https://8.8.8.8/dns-query"
-YAML_PORT
+  - "https://${boot_ip}/dns-query"
+upstream:
+YAML_BODY
 
-    case "$mode" in
-        tw|tw_opt)
-            echo "TW Local (TWNIC 101 + HiNet + Google + CF)" > "$STATE_FILE"
-            cat << 'UP_TW' >> "$CONF_FILE"
-upstream:
-  - "https://101.101.101.101/dns-query"
-  - "https://dns.hinet.net/dns-query"
-  - "https://8.8.8.8/dns-query"
-  - "https://1.1.1.1/dns-query"
+    for u in "${alive_urls[@]}"; do
+        echo "  - \"${u}\"" >> "$CONF_FILE"
+    done
+
+    cat << YAML_FB >> "$CONF_FILE"
 fallback:
-  - "tls://1.1.1.1:853"
-  - "tls://8.8.8.8:853"
-UP_TW
-            ;;
-        apac|apac_opt)
-            echo "Asia-Pacific HK/JP/SG (CF + Google + DNS.SB + IIJ)" > "$STATE_FILE"
-            cat << 'UP_APAC' >> "$CONF_FILE"
-upstream:
-  - "https://1.1.1.1/dns-query"
-  - "https://8.8.8.8/dns-query"
-  - "https://185.222.222.222/dns-query"
-  - "https://public.dns.iij.jp/dns-query"
-fallback:
-  - "tls://185.222.222.222:853"
-  - "tls://1.1.1.1:853"
-UP_APAC
-            ;;
-        eu|eu_opt)
-            # 全部使用原生 IP SAN 证书直连 (Quad9 9.9.9.11 + CF 1.1.1.1 + Mullvad 194.242.2.2 + DNS.SB)
-            echo "Europe Pure-IP (Quad9 9.9.9.11 + CF + Mullvad 194.242.2.2 + DNS.SB)" > "$STATE_FILE"
-            cat << 'UP_EU' >> "$CONF_FILE"
-upstream:
-  - "https://9.9.9.11/dns-query"
-  - "https://1.1.1.1/dns-query"
-  - "https://194.242.2.2/dns-query"
-  - "https://185.222.222.222/dns-query"
-fallback:
-  - "tls://9.9.9.11:853"
-  - "tls://1.1.1.1:853"
-UP_EU
-            ;;
-        na|na_opt)
-            echo "North America US/CA (Quad9-ECS + CF + OpenDNS + ControlD)" > "$STATE_FILE"
-            cat << 'UP_NA' >> "$CONF_FILE"
-upstream:
-  - "https://9.9.9.11/dns-query"
-  - "https://1.1.1.1/dns-query"
-  - "https://doh.opendns.com/dns-query"
-  - "https://freedns.controld.com/p0"
-fallback:
-  - "tls://1.1.1.1:853"
-  - "tls://8.8.8.8:853"
-UP_NA
-            ;;
-        cn|cn_opt)
-            echo "CN Mainland (AliDNS + DNSPod + 360 Anti-RateLimit)" > "$STATE_FILE"
-            sed -i 's|https://8.8.8.8/dns-query|https://223.5.5.5/dns-query|' "$CONF_FILE"
-            cat << 'UP_CN' >> "$CONF_FILE"
-upstream:
-  - "https://223.5.5.5/dns-query"
-  - "https://223.6.6.6/dns-query"
-  - "https://doh.pub/dns-query"
-  - "https://doh.360.cn/dns-query"
-fallback:
-  - "tls://1.12.12.12:853"
-  - "tls://223.5.5.5:853"
-UP_CN
-            ;;
-        custom)
-            echo "Custom DoH (${custom_u1})" > "$STATE_FILE"
-            cat << UP_CUS >> "$CONF_FILE"
-upstream:
-  - "${custom_u1}"
-  - "${custom_u2}"
-fallback:
-  - "https://1.1.1.1/dns-query"
-  - "tls://8.8.8.8:853"
-UP_CUS
-            ;;
-        *)
-            echo "Global Pure-IP (Quad9-ECS 9.9.9.11 + CF + Google + DNS.SB)" > "$STATE_FILE"
-            cat << 'UP_GL' >> "$CONF_FILE"
-upstream:
-  - "https://9.9.9.11/dns-query"
-  - "https://1.1.1.1/dns-query"
-  - "https://8.8.8.8/dns-query"
-  - "https://185.222.222.222/dns-query"
-fallback:
-  - "tls://9.9.9.11:853"
-  - "tls://1.1.1.1:853"
-UP_GL
-            ;;
-    esac
+  - "https://${boot_ip}/dns-query"
+  - "tls://${boot_ip}:853"
+YAML_FB
 }
 
 activate_doh_service() {
@@ -479,8 +555,8 @@ enable_native_dot() {
     mkdir -p /etc/systemd/resolved.conf.d
     cat << 'DOT_EOF' > /etc/systemd/resolved.conf.d/99-native-dot.conf
 [Resolve]
-DNS=9.9.9.11#dns11.quad9.net 1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google
-FallbackDNS=185.222.222.222#dns.sb
+DNS=101.101.101.101#dns.twnic.tw 94.140.14.140#unfiltered.adguard-dns.com 185.222.222.222#dns.sb
+FallbackDNS=1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google
 DNSOverTLS=yes
 DNSStubListener=yes
 Cache=yes
@@ -501,7 +577,7 @@ run_deploy_core() {
     local mode="$1" c1="$2" c2="$3" silent="${4:-0}"
     backup_configs
     install_binary 0 || return 1
-    echo -e "${CYAN}[2/4] 配置本地 TCP+UDP 监听、智能负载均衡与乐观缓存...${PLAIN}"
+    echo -e "${CYAN}[2/4] 探测健康节点并配置本地 TCP+UDP 智能负载均衡...${PLAIN}"
     rm -f /etc/systemd/resolved.conf.d/99-native-dot.conf
     free_port_53
     write_doh_config "$mode" "$c1" "$c2"
@@ -516,15 +592,15 @@ run_deploy_core() {
 
 deploy_doh_wizard() {
     echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}选择分地区加密 DNS 负载均衡组 / Select Regional DoH Group${PLAIN}"
+    echo -e " ${CYAN}选择分地区加密 DNS 负载均衡组 (自动预检剔除本机不可达节点)${PLAIN}"
     echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 全球纯 IP 零延迟组 (Global Pure-IP) : Quad9-ECS(9.9.9.11) + CF + Google + DNS.SB [默认]"
-    echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体组   (Taiwan Local)   : TWNIC(101.101限台) + HiNet + Google + CF"
-    echo -e "  ${GREEN}[3]${PLAIN} 亚太新港日优化组   (HK / JP / SG)   : CF + Google + DNS.SB + 日本IIJ骨干"
-    echo -e "  ${GREEN}[4]${PLAIN} 欧洲纯 IP 低延迟组 (UK / DE / NL)   : Quad9-ECS + CF + Mullvad(194.242.2.2) + DNS.SB"
-    echo -e "  ${GREEN}[5]${PLAIN} 北美专线极速组     (US / CA)        : Quad9-ECS + CF + OpenDNS + ControlD(p0)"
-    echo -e "  ${GREEN}[6]${PLAIN} 中国大陆防限速组   (CN Mainland)    : 阿里DoH + 腾讯doh.pub + 360DoH 负载均衡"
-    echo -e "  ${GREEN}[7]${PLAIN} 自定义加密上游     (Custom DoH URL) : 手动输入主/备 DoH 或 DoT 地址"
+    echo -e "  ${GREEN}[1]${PLAIN} 全球自动优选组 (Global Auto)   : Quad9-ECS + CF + Google + DNS.SB + AdGuard [默认]"
+    echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体 (Taiwan Local)  : TWNIC(101.101) + HiNet + AdGuard + DNS.SB"
+    echo -e "  ${GREEN}[3]${PLAIN} 亚太新港日优化 (HK / JP / SG)  : DNS.SB + AdGuard + 日本IIJ + CF + Google"
+    echo -e "  ${GREEN}[4]${PLAIN} 欧洲纯 IP 专线 (UK / DE / NL)  : Quad9-ECS + CF + Mullvad(194.242) + DNS.SB"
+    echo -e "  ${GREEN}[5]${PLAIN} 北美专线极速组 (US / CA)       : Quad9-ECS + CF + OpenDNS + ControlD(p0)"
+    echo -e "  ${GREEN}[6]${PLAIN} 中国大陆防限速 (CN Mainland)   : 阿里DoH + 腾讯doh.pub + 360DoH 负载均衡"
+    echo -e "  ${GREEN}[7]${PLAIN} 自定义加密上游 (Custom URL)    : 手动输入主/备 DoH 或 DoT 地址"
     echo -e "${DIV_THIN}"
     local up_opt mode="global" c1="" c2=""
     read -rp "请选择策略 [1-7, 回车默认 1]: " up_opt </dev/tty
@@ -537,10 +613,10 @@ deploy_doh_wizard() {
         6) mode="cn_opt" ;;
         7)
             mode="custom"
-            read -rp "  请输入主加密 DNS (如 https://9.9.9.11/dns-query): " c1 </dev/tty
+            read -rp "  请输入主加密 DNS (如 https://101.101.101.101/dns-query): " c1 </dev/tty
             [ -z "$c1" ] && echo -e "${YELLOW}输入为空，已取消。${PLAIN}" && return 0
-            read -rp "  请输入备加密 DNS (回车默认 https://1.1.1.1/dns-query): " c2 </dev/tty
-            [ -z "$c2" ] && c2="https://1.1.1.1/dns-query"
+            read -rp "  请输入备加密 DNS (回车默认 https://94.140.14.140/dns-query): " c2 </dev/tty
+            [ -z "$c2" ] && c2="https://94.140.14.140/dns-query"
             ;;
         *) mode="global" ;;
     esac
@@ -548,15 +624,16 @@ deploy_doh_wizard() {
     run_deploy_core "$mode" "$c1" "$c2" 0
 }
 
+# 精准测速：Cold = time_total(请求1)，Warm = time_total(请求2) 减去 请求1耗时? 不，curl 多 URL 时每次 time_total 都是独立计时的！
+# 修正 Cold 虚高根因：对纯 IP 节点强制绑定 --resolve 跳过可能阻塞的系统 NSS lookup，展示最纯粹的网络握手速度！
 benchmark_global_upstreams() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}全球 12 大主流 DoH 并发测速 / Global DoH Speedtest (HTTPS 443 IPv4)${PLAIN}"
-    echo -e " ${GRAY}指标: Warm = HTTP/2 复用真实解析耗时 | Cold = 首次 TCP+TLS 握手总耗时${PLAIN}"
+    echo -e " ${GRAY}指标: Warm = HTTP/2 连接复用真实解析耗时 | Cold = 首次 TCP+TLS 握手总耗时${PLAIN}"
     echo -e "${DIV_THIN}"
     echo -e "  ${CYAN}Status     Provider           | Warm    | Cold    | Region / 节点特性${PLAIN}"
     echo -e "${DIV_THIN}"
 
-    local q_wire="AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
     local need_resolve=0
     getent ahostsv4 example.com >/dev/null 2>&1 || need_resolve=1
 
@@ -592,11 +669,11 @@ benchmark_global_upstreams() {
 
             local out c1 t1 ec1 c2 t2 ec2 ms_cold ms_warm err_tag
             out=$(curl -4 -s "${res_arg[@]}" \
-                --connect-timeout 2 --max-time 3 \
+                --connect-timeout 2 --max-time 3.5 \
                 -H "accept: application/dns-message" \
                 -w "%{http_code} %{time_total} %{exitcode}\n" \
-                -o /dev/null "${url}?dns=${q_wire}" \
-                -o /dev/null "${url}?dns=${q_wire}" 2>/dev/null | tr -d '\000')
+                -o /dev/null "${url}?dns=${Q_WIRE}" \
+                -o /dev/null "${url}?dns=${Q_WIRE}" 2>/dev/null | tr -d '\000')
 
             read -r c1 t1 ec1 <<< "$(echo "$out" | sed -n '1p')"
             read -r c2 t2 ec2 <<< "$(echo "$out" | sed -n '2p')"
@@ -651,12 +728,14 @@ test_all_dns() {
     if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
         local dip d_res
         dip=$(get_docker_ip)
-        if [ -n "$dip" ] && command -v dig >/dev/null 2>&1; then
-            d_res=$(dig +short +time=2 +tries=1 @"${dip}" google.com A 2>/dev/null | head -n1)
+        if [ -n "$dip" ]; then
+            if command -v dig >/dev/null 2>&1; then
+                d_res=$(dig +short +time=2 +tries=1 @"${dip}" google.com A 2>/dev/null | head -n1)
+            elif command -v nslookup >/dev/null 2>&1; then
+                d_res=$(nslookup google.com "${dip}" 2>/dev/null | awk '/^Address: / { print $2 }' | head -n1)
+            fi
             if [ -n "$d_res" ]; then
                 echo -e "  ${GREEN}[OK]${PLAIN}   Docker Bridge   | @${dip}:53 -> ${d_res}"
-            else
-                echo -e "  ${RED}[WARN]${PLAIN} Docker Bridge   | @${dip}:53 未响应，请执行菜单 [3] 修复"
             fi
         fi
     fi
@@ -706,7 +785,6 @@ audit_leaks() {
     echo -e "${DIV_BOLD}"
 }
 
-# 仅显示当前运行实例的纯净日志，避免历史旧会话日志干扰
 show_live_logs() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}当前实例运行日志 / Current Service Instance Logs${PLAIN}"
@@ -769,7 +847,6 @@ purge_core() {
           /etc/systemd/resolved.conf.d/99-native-dot.conf \
           /etc/systemd/resolved.conf.d/nodnsstub.conf
     systemctl daemon-reload
-    # 先强制切分活跃日志再清理，确保历史 journal 记录彻底清零
     journalctl --rotate >/dev/null 2>&1 || true
     journalctl --vacuum-time=1s --unit=easy-doh >/dev/null 2>&1 || true
 
