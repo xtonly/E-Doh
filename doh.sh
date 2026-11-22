@@ -1,21 +1,22 @@
-cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
 # ==============================================================================
-# Project   : Easy-DoH Manager (v2.9 Release)
-# Author    : xtonly
+# Project   : E-Doh Manager (v3.0 Release)
+# Repo      : https://github.com/xtonly/E-Doh
 # Features  : Dead-Node Auto-Prune | Multi-API Bootstrap | Docker Guard | Purge
-# Usage     : Interactive -> doh | Unattended -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
+# Usage     : Interactive -> doh | CLI -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
 # ==============================================================================
 
-VERSION="2.9"
-GH_REPO="xtonly/Easy-DoH"
+VERSION="3.0"
+GH_REPO="xtonly/E-Doh"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
 
+# 多源回退链：GitHub Raw 主源优先 -> Cloudflare CDN 次选 -> Fastly / Global jsDelivr 兜底
 RAW_URLS=(
-    "https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/doh.sh"
+    "https://raw.githubusercontent.com/${GH_REPO}/refs/heads/${GH_BRANCH}/doh.sh"
     "https://testingcf.jsdelivr.net/gh/${GH_REPO}@${GH_BRANCH}/doh.sh"
     "https://fastly.jsdelivr.net/gh/${GH_REPO}@${GH_BRANCH}/doh.sh"
+    "https://cdn.jsdelivr.net/gh/${GH_REPO}@${GH_BRANCH}/doh.sh"
 )
 
 RED='\033[1;31m'
@@ -44,7 +45,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 6 路纯 IP DoH 容灾解析 (彻底防 1.1.1.1 / 8.8.8.8 被黑洞的环境)
+# 多路纯 IP DoH 容灾解析 (防 1.1.1.1 / 8.8.8.8 被黑洞的环境)
 doh_lookup_ip() {
     local domain="$1" ip=""
     local apis=(
@@ -62,7 +63,7 @@ doh_lookup_ip() {
     echo "$ip"
 }
 
-# 快速探测单个 DoH 节点是否存活 (200 OK 返回 0，超时/阻断返回 1)
+# 快速探测单个 DoH 节点是否存活
 probe_doh_alive() {
     local url="$1" b_ip="${2:-}" host rip res_arg=() code
     host=$(echo "$url" | awk -F/ '{print $3}')
@@ -81,7 +82,7 @@ probe_doh_alive() {
     [ "$code" = "200" ]
 }
 
-# 自动优选本机最快且存活的单一纯 IP Bootstrap (杜绝 8.8.8.8/1.1.1.1 黑洞导致域名节点解析失败)
+# 自动优选本机存活的单一纯 IP Bootstrap
 pick_best_bootstrap() {
     local prefer="$1"
     local candidates=("$prefer" "101.101.101.101" "94.140.14.140" "185.222.222.222" "8.8.8.8" "1.1.1.1" "223.5.5.5")
@@ -101,8 +102,9 @@ pick_best_bootstrap() {
     echo "94.140.14.140"
 }
 
+# 支持免 DNS 环境拉取远程脚本 (GitHub 主源附带防缓存参数，失败自动切换 Cloudflare jsDelivr)
 fetch_remote_script() {
-    local target="$1" url host rip res_arg=()
+    local target="$1" url fetch_url host rip res_arg=()
     for url in "${RAW_URLS[@]}"; do
         host=$(echo "$url" | awk -F/ '{print $3}')
         res_arg=()
@@ -110,8 +112,12 @@ fetch_remote_script() {
             rip=$(doh_lookup_ip "$host")
             [ -n "$rip" ] && res_arg=(--resolve "${host}:443:${rip}")
         fi
-        if curl -4 -fsSL "${res_arg[@]}" --connect-timeout 6 --max-time 15 "$url" -o "$target" 2>/dev/null; then
-            if grep -q "Easy-DoH Manager" "$target" 2>/dev/null; then
+        fetch_url="$url"
+        [[ "$host" == "raw.githubusercontent.com" ]] && fetch_url="${url}?t=$(date +%s)"
+
+        if curl -4 -fsSL "${res_arg[@]}" -H "Cache-Control: no-cache" --connect-timeout 5 --max-time 15 "$fetch_url" -o "$target" 2>/dev/null; then
+            if grep -qE "(E-Doh|Easy-DoH) Manager" "$target" 2>/dev/null; then
+                echo -e "${GRAY}  -> 成功命中源 (Source): ${host}${PLAIN}"
                 return 0
             fi
         fi
@@ -121,14 +127,14 @@ fetch_remote_script() {
 
 bootstrap_self() {
     if [ ! -f "$0" ] || [[ "$0" == *"/dev/fd/"* ]] || [ "$0" = "bash" ] || [ "$0" = "-bash" ]; then
-        echo -e "${CYAN}[Init] 检测到管道流执行，正在将管理命令固化至 ${SCRIPT_PATH} ...${PLAIN}"
+        echo -e "${CYAN}[Init] 检测到远程管道执行，正在将管理命令固化至 ${SCRIPT_PATH} ...${PLAIN}"
         if fetch_remote_script "${SCRIPT_PATH}.tmp"; then
             mv -f "${SCRIPT_PATH}.tmp" "$SCRIPT_PATH"
             chmod +x "$SCRIPT_PATH"
             echo -e "${GREEN}[OK] 命令固化成功！以后随时输入 'doh' 即可呼出面板。${PLAIN}"
             exec "$SCRIPT_PATH" "$@" </dev/tty
         else
-            echo -e "${YELLOW}[Warn] 远程源尚未同步，直接进入当前交互会话...${PLAIN}"
+            echo -e "${YELLOW}[Warn] 远程源拉取跳过，直接进入当前交互会话...${PLAIN}"
         fi
     elif [ "$(realpath "$0" 2>/dev/null)" != "$SCRIPT_PATH" ]; then
         cp -f "$0" "$SCRIPT_PATH"
@@ -185,16 +191,17 @@ get_arch() {
 }
 
 install_binary() {
-    local force_update="${1:-0}"
-    if [ "$force_update" -eq 0 ] && [ -x "$BIN_PATH" ] && "$BIN_PATH" --version >/dev/null 2>&1; then
-        return 0
+    local check_update="${1:-0}" cur_ver=""
+    if [ -x "$BIN_PATH" ] && "$BIN_PATH" --version >/dev/null 2>&1; then
+        cur_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
+        [ "$check_update" -eq 0 ] && return 0
     fi
 
     local arch api_ip gh_ip obj_ip ver pkg url tmp_tar
     arch=$(get_arch)
     [ "$arch" = "unsupported" ] && echo -e "${RED}[Error] 不支持的架构 / Unsupported arch: $(uname -m)${PLAIN}" && return 1
 
-    echo -e "${CYAN}[1/4] 正在通过多路 443 加密通道查询 GitHub 最新 dnsproxy 版本...${PLAIN}"
+    echo -e "${CYAN}  -> 正在通过加密通道查询 GitHub 最新 dnsproxy 版本...${PLAIN}"
     api_ip=$(doh_lookup_ip "api.github.com"); [ -z "$api_ip" ] && api_ip="140.82.114.6"
     gh_ip=$(doh_lookup_ip "github.com");       [ -z "$gh_ip" ] && gh_ip="140.82.114.4"
     obj_ip=$(doh_lookup_ip "objects.githubusercontent.com"); [ -z "$obj_ip" ] && obj_ip="185.199.108.133"
@@ -204,12 +211,17 @@ install_binary() {
         | grep -oE '"tag_name": *"v[0-9.]+"' | head -n1 | cut -d'"' -f4)
     [ -z "$ver" ] && ver="v0.86.0"
 
+    if [ "$check_update" -eq 1 ] && [ -n "$cur_ver" ] && [ "$cur_ver" = "$ver" ]; then
+        echo -e "${GREEN}  -> 当前 dnsproxy 内核已是最新版本 (${cur_ver})，无需重复下载！${PLAIN}"
+        return 0
+    fi
+
     pkg="dnsproxy-${arch}-${ver}.tar.gz"
     url="https://github.com/AdguardTeam/dnsproxy/releases/download/${ver}/${pkg}"
     tmp_tar="/tmp/${pkg}"
 
-    echo -e "${CYAN}  -> 正在直连下载 dnsproxy (${ver} / ${arch})...${PLAIN}"
-    curl -4 -kL --connect-timeout 15 --retry 2 \
+    echo -e "${CYAN}  -> 正在直连下载 dnsproxy (${cur_ver:+${cur_ver} -> }${ver} / ${arch})...${PLAIN}"
+    curl -4 -kL -# --connect-timeout 15 --retry 2 \
         --resolve "github.com:443:${gh_ip}" \
         --resolve "objects.githubusercontent.com:443:${obj_ip}" \
         --resolve "release-assets.githubusercontent.com:443:${obj_ip}" \
@@ -249,7 +261,6 @@ RES_EOF
     fi
 }
 
-# 智能健康过滤生成配置：自动剔除本机被墙/黑洞的 DoH 节点，防止慢节点拖累整体延迟到 1700ms+
 write_doh_config() {
     mkdir -p "$WORK_DIR"
     local mode="${1:-global}" custom_u1="$2" custom_u2="$3" dip
@@ -354,7 +365,6 @@ write_doh_config() {
         echo -e "${YELLOW}  -> [避坑] 已自动剔除本机超时的黑洞节点: $(IFS=', '; echo "${dead_names[*]}")${PLAIN}"
     fi
 
-    # 极端情况兜底：若该组全部超时，启用验证存活的 boot_ip 作为保底上游
     if [ ${#alive_urls[@]} -eq 0 ]; then
         alive_urls=("https://${boot_ip}/dns-query")
         alive_names=("Fallback-${boot_ip}")
@@ -366,7 +376,7 @@ write_doh_config() {
     echo -e "${GREEN}  -> 已启用存活节点: ${joined_names} (Bootstrap: ${boot_ip})${PLAIN}"
 
     cat << YAML_EOF > "$CONF_FILE"
-# Easy-DoH Config v${VERSION} (Auto-Pruned Healthy Upstreams)
+# E-Doh Config v${VERSION} (Auto-Pruned Healthy Upstreams)
 listen-addrs:
   - "127.0.0.1"
 YAML_EOF
@@ -399,7 +409,7 @@ YAML_FB
 activate_doh_service() {
     cat << SVC_EOF > "$SERVICE_FILE"
 [Unit]
-Description=Easy-DoH Local Encrypted DNS Proxy (TCP/UDP)
+Description=E-Doh Local Encrypted DNS Proxy (TCP/UDP)
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -420,7 +430,7 @@ SVC_EOF
     sleep 1
 
     if ! systemctl is-active --quiet easy-doh; then
-        echo -e "${RED}[Error] easy-doh 启动失败，请按 [7] 查看运行日志！${PLAIN}"
+        echo -e "${RED}[Error] 服务启动失败，请按 [7] 查看运行日志！${PLAIN}"
         return 1
     fi
 
@@ -428,7 +438,7 @@ SVC_EOF
     save_orig_resolv
     rm -f /etc/resolv.conf
     cat << 'R_EOF' > /etc/resolv.conf
-# Managed by Easy-DoH (TCP+UDP 53 -> DoH/DoT)
+# Managed by E-Doh (TCP+UDP 53 -> DoH/DoT)
 nameserver 127.0.0.1
 options edns0 trust-ad timeout:2 attempts:2
 R_EOF
@@ -576,6 +586,7 @@ DOT_EOF
 run_deploy_core() {
     local mode="$1" c1="$2" c2="$3" silent="${4:-0}"
     backup_configs
+    echo -e "${CYAN}[1/4] 检查并准备 dnsproxy 核心组件...${PLAIN}"
     install_binary 0 || return 1
     echo -e "${CYAN}[2/4] 探测健康节点并配置本地 TCP+UDP 智能负载均衡...${PLAIN}"
     rm -f /etc/systemd/resolved.conf.d/99-native-dot.conf
@@ -624,8 +635,6 @@ deploy_doh_wizard() {
     run_deploy_core "$mode" "$c1" "$c2" 0
 }
 
-# 精准测速：Cold = time_total(请求1)，Warm = time_total(请求2) 减去 请求1耗时? 不，curl 多 URL 时每次 time_total 都是独立计时的！
-# 修正 Cold 虚高根因：对纯 IP 节点强制绑定 --resolve 跳过可能阻塞的系统 NSS lookup，展示最纯粹的网络握手速度！
 benchmark_global_upstreams() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}全球 12 大主流 DoH 并发测速 / Global DoH Speedtest (HTTPS 443 IPv4)${PLAIN}"
@@ -798,7 +807,7 @@ show_live_logs() {
             journalctl -u easy-doh -n 25 --no-pager
         fi
     else
-        echo -e "  ${GRAY}当前 easy-doh 未运行 (Service is currently stopped).${PLAIN}"
+        echo -e "  ${GRAY}当前服务未运行 (Service is currently stopped).${PLAIN}"
     fi
     echo -e "${DIV_BOLD}"
 }
@@ -807,8 +816,8 @@ update_self_and_core() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}在线无损更新 / Lossless Update (Script + dnsproxy Core)${PLAIN}"
     echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 仅更新管理脚本 (${GH_REPO}) [GitHub 主源 + CDN 回退]"
-    echo -e "  ${GREEN}[2]${PLAIN} 仅更新 AdGuard dnsproxy 内核二进制 (平滑热重启)"
+    echo -e "  ${GREEN}[1]${PLAIN} 仅更新管理脚本 (${GH_REPO}) [GitHub 主源 + Cloudflare 回退]"
+    echo -e "  ${GREEN}[2]${PLAIN} 仅检查并更新 AdGuard dnsproxy 内核二进制 (平滑热重启)"
     echo -e "  ${GREEN}[3]${PLAIN} 同时更新管理脚本 + dnsproxy 内核"
     echo -e "${DIV_THIN}"
     local u_opt
@@ -816,20 +825,30 @@ update_self_and_core() {
     u_opt=$(echo "$u_opt" | tr -d '[:space:]')
 
     if [[ "$u_opt" = "2" || "$u_opt" = "3" ]]; then
-        install_binary 1 && systemctl is-active --quiet easy-doh && systemctl restart easy-doh
+        local old_bin_ver="" new_bin_ver=""
+        [ -x "$BIN_PATH" ] && old_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
+        if install_binary 1; then
+            new_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
+            if [ "$old_bin_ver" != "$new_bin_ver" ] && systemctl is-active --quiet easy-doh; then
+                systemctl restart easy-doh
+                echo -e "${GREEN}  -> 已平滑重启服务应用新内核 (${new_bin_ver})！${PLAIN}"
+            fi
+        fi
     fi
 
     if [[ "$u_opt" = "1" || "$u_opt" = "3" ]]; then
-        echo -e "${CYAN}  -> 正在从远程仓库拉取最新 doh.sh ...${PLAIN}"
+        echo -e "${CYAN}  -> 正在从远程仓库 (${GH_REPO}) 拉取最新 doh.sh ...${PLAIN}"
         if fetch_remote_script "${SCRIPT_PATH}.new"; then
+            local remote_ver
+            remote_ver=$(grep -m1 '^VERSION=' "${SCRIPT_PATH}.new" | cut -d'"' -f2)
             mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
             chmod +x "$SCRIPT_PATH"
-            echo -e "${GREEN}  -> 脚本更新完成！即将重新加载新版本面板...${PLAIN}"
+            echo -e "${GREEN}  -> 脚本已同步至最新 (v${VERSION} -> v${remote_ver:-latest})！正在重载面板...${PLAIN}"
             sleep 1
             exec "$SCRIPT_PATH" </dev/tty
         else
             rm -f "${SCRIPT_PATH}.new"
-            echo -e "${RED}[Warn] 远程拉取失败（请确认 GitHub 仓库 ${GH_REPO} 已创建并设为 Public）。${PLAIN}"
+            echo -e "${RED}[Warn] 远程拉取失败（请确认 GitHub 仓库 ${GH_REPO} 已设为 Public 且存在 doh.sh）。${PLAIN}"
         fi
     fi
 }
@@ -938,7 +957,7 @@ render_menu() {
 
     clear
     echo -e "${DIV_BOLD}"
-    echo -e "   ${CYAN}Easy-DoH Manager v${VERSION}${PLAIN}  |  本地加密 DNS 与全球分流管理面板 (cmd: ${GREEN}doh${PLAIN})"
+    echo -e "   ${CYAN}E-Doh Manager v${VERSION}${PLAIN}  |  本地加密 DNS 与全球分流管理面板 (cmd: ${GREEN}doh${PLAIN})"
     echo -e "${DIV_BOLD}"
     echo -e "  运行状态 Engine   : ${eng_str}"
     echo -e "  监听端点 Listen   : ${listen_str}"
@@ -1015,5 +1034,3 @@ while true; do
             ;;
     esac
 done
-EOF
-chmod +x /usr/local/bin/doh && doh
