@@ -1,13 +1,13 @@
 cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
 # ==============================================================================
-# Project   : E-Doh Manager (v3.3 Release)
+# Project   : E-Doh Manager (v3.4 Release)
 # Repo      : https://github.com/xtonly/E-Doh
-# Features  : Split-DNS for ISP API (100.100.101.x) | Auto-Prune | Docker Guard
-# Usage     : Interactive -> doh | CLI -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
+# Features  : TW 100.100.101.x Route & ChangeIP | Auto-Prune DoH | Docker Guard
+# Usage     : doh | doh --auto [global|tw|apac|eu|na|cn] | doh --changeip | doh --purge
 # ==============================================================================
 
-VERSION="3.3"
+VERSION="3.4"
 GH_REPO="xtonly/E-Doh"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
@@ -31,10 +31,12 @@ BACKUP_DIR="${WORK_DIR}/backups"
 BIN_PATH="/usr/local/bin/dnsproxy"
 CONF_FILE="${WORK_DIR}/config.yaml"
 STATE_FILE="${WORK_DIR}/profile.state"
-SPLIT_CONF="${WORK_DIR}/split_dns.conf"
 SERVICE_FILE="/etc/systemd/system/easy-doh.service"
+ROUTE_SERVICE="/etc/systemd/system/edoh-isp-route.service"
 DOCKER_DAEMON="/etc/docker/daemon.json"
 
+ISP_API_IPS=("100.100.101.101" "100.100.101.102")
+ISP_API_PORT="8002"
 Q_WIRE="AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
 
 DIV_BOLD="${CYAN}========================================================================${PLAIN}"
@@ -164,7 +166,6 @@ backup_configs() {
     [ -f /etc/resolv.conf ] && files_to_bak+=("/etc/resolv.conf")
     [ -f "$DOCKER_DAEMON" ] && files_to_bak+=("$DOCKER_DAEMON")
     [ -f "$CONF_FILE" ] && files_to_bak+=("$CONF_FILE")
-    [ -f "$SPLIT_CONF" ] && files_to_bak+=("$SPLIT_CONF")
 
     if [ ${#files_to_bak[@]} -gt 0 ]; then
         tar -czf "$tar_file" "${files_to_bak[@]}" 2>/dev/null
@@ -176,6 +177,28 @@ get_docker_ip() {
     if command -v docker >/dev/null 2>&1 && ip addr show docker0 >/dev/null 2>&1; then
         ip -4 addr show docker0 | grep -oE 'inet [0-9.]+' | awk '{print $2}' | head -n1
     fi
+}
+
+# 提取物理主网卡与内网网关 (排除 tun/wg/docker/mihomo 等虚拟接口干扰)
+get_wan_gw_dev() {
+    local line gw dev
+    line=$(ip -4 route show table main default 2>/dev/null | grep -vE 'dev (tun|tap|wg|utun|docker|br-|veth|tailscale|clash|mihomo|sing)' | head -n1)
+    [ -z "$line" ] && line=$(ip -4 route show default 2>/dev/null | head -n1)
+    gw=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
+    dev=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    echo "${gw}|${dev}"
+}
+
+get_public_ipv4() {
+    local pub=""
+    for u in "https://api-ipv4.ip.sb/ip" "https://ipv4.icanhazip.com" "https://api.ipify.org" "http://ip.sb"; do
+        pub=$(curl -4 --noproxy "*" -fsSL --connect-timeout 2 --max-time 4 "$u" 2>/dev/null | tr -d '[:space:]')
+        if echo "$pub" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "$pub"
+            return 0
+        fi
+    done
+    echo "获取超时"
 }
 
 get_arch() {
@@ -258,35 +281,9 @@ RES_EOF
     fi
 }
 
-# 将 /etc/easy-doh/split_dns.conf 中的私有域名分流规则挂载进 config.yaml
-inject_split_rules_to_yaml() {
-    [ ! -s "$SPLIT_CONF" ] || [ ! -f "$CONF_FILE" ] && return 0
-    # 先清理旧的注入行 (以 "[/" 开头的上游规则)，再重新注入最新规则
-    sed -i '/"\[\/.*\/\]/d' "$CONF_FILE"
-    while IFS='|' read -r dom_str dns_ips; do
-        [ -z "$dom_str" ] || [ -z "$dns_ips" ] && continue
-        local spec_path="" d ip
-        IFS=',' read -ra d_arr <<< "$dom_str"
-        for d in "${d_arr[@]}"; do
-            d=$(echo "$d" | tr -d '[:space:]')
-            # 若用户输入了完整 URL (如 http://api.xxx.com/ip)，自动剥离提取纯域名
-            d=$(echo "$d" | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##')
-            [ -n "$d" ] && spec_path="${spec_path}${d}/"
-        done
-        [ -z "$spec_path" ] && continue
-
-        IFS=',' read -ra ip_arr <<< "$dns_ips"
-        for ip in "${ip_arr[@]}"; do
-            ip=$(echo "$ip" | tr -d '[:space:]')
-            [ -z "$ip" ] && continue
-            [[ "$ip" != *:* ]] && ip="${ip}:53"
-            sed -i "/^upstream:/a \  - \"[/${spec_path}]${ip}\"" "$CONF_FILE"
-        done
-    done < "$SPLIT_CONF"
-}
-
 write_doh_config() {
     mkdir -p "$WORK_DIR"
+    rm -f "${WORK_DIR}/split_dns.conf" 2>/dev/null || true
     local mode="${1:-global}" custom_u1="$2" custom_u2="$3" dip
     dip=$(get_docker_ip)
 
@@ -409,7 +406,7 @@ write_doh_config() {
     echo -e "${GREEN}  -> 已启用存活节点: ${joined_names} (Bootstrap: ${boot_ip})${PLAIN}"
 
     cat << YAML_EOF > "$CONF_FILE"
-# E-Doh Config v${VERSION} (Auto-Pruned Healthy Upstreams + Split-DNS)
+# E-Doh Config v${VERSION} (Auto-Pruned Healthy Upstreams)
 listen-addrs:
   - "127.0.0.1"
 YAML_EOF
@@ -437,109 +434,151 @@ fallback:
   - "https://${boot_ip}/dns-query"
   - "tls://${boot_ip}:853"
 YAML_FB
-
-    # 自动挂载已保存的商家内网专属分流规则 (如 100.100.101.101/102)
-    inject_split_rules_to_yaml
 }
 
-# 商家内网 DNS 分流管理模块 (专为 TW HiNet/Seednet 100.100.101.101/102 动态换 IP API 设计)
-manage_split_dns() {
-    mkdir -p "$WORK_DIR"
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}商家内网私有 DNS 分流 / ISP Split-DNS (TW HiNet/Seednet 换 IP 专用)${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e " ${GRAY}原理：仅将指定的商家换 IP API 域名定向至内网 100.100.101.101/102 解析，${PLAIN}"
-    echo -e " ${GRAY}其余所有正常上网流量依然 100% 走加密 DoH，彻底解决换 IP 失败且不漏请求！${PLAIN}"
-    echo -e "${DIV_THIN}"
+# ==============================================================================
+# TW HiNet / Seednet 内网换 IP 静态路由守护与一键重拨模块 (100.100.101.101/102:8002)
+# ==============================================================================
+enable_isp_route() {
+    local gw_dev gw dev
+    gw_dev=$(get_wan_gw_dev)
+    gw="${gw_dev%%|*}"
+    dev="${gw_dev##*|}"
 
-    if [ -s "$SPLIT_CONF" ]; then
-        echo -e "  ${GREEN}当前已生效的分流规则 (Active Split Rules):${PLAIN}"
-        local idx=0
-        while IFS='|' read -r d_list i_list; do
-            idx=$((idx + 1))
-            echo -e "    #${idx}: 域名 [${YELLOW}${d_list}${PLAIN}] -> 内网 DNS [${CYAN}${i_list}${PLAIN}]"
-        done < "$SPLIT_CONF"
-    else
-        echo -e "  ${GRAY}当前暂未配置内网分流规则 (No split rules configured).${PLAIN}"
+    if [ -z "$gw" ] || [ -z "$dev" ]; then
+        echo -e "${RED}  [Error] 无法自动识别主网卡与内网网关，请检查 ip route 输出！${PLAIN}"
+        return 1
     fi
 
-    # 自动扫描本机 crontab 或脚本中可能存在的换 IP API 域名提示给用户
-    local hints
-    hints=$(grep -rhEo 'https?://[a-zA-Z0-9._-]+' /etc/crontab /etc/cron* /var/spool/cron/ /root/*.sh /opt/*.sh 2>/dev/null \
-        | sed -E 's#^https?://##' | grep -vE '^(raw\.githubusercontent\.com|api\.github\.com|github\.com|1\.1\.1\.1|8\.8\.8\.8|deb\.debian\.org|security\.debian\.org|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$' \
-        | sort -u | paste -sd ", " - || true)
-    [ -n "$hints" ] && echo -e "  ${GRAY}本机定时任务/脚本发现的候选域名: ${YELLOW}${hints}${PLAIN}"
+    for aip in "${ISP_API_IPS[@]}"; do
+        ip route replace "${aip}/32" via "$gw" dev "$dev"
+    done
 
+    # 写入 systemd 开机自启守护，防止重启或网卡重置丢失 100.100.101.x 路由
+    cat << RT_EOF > "$ROUTE_SERVICE"
+[Unit]
+Description=E-Doh TW ISP ChangeIP Static Route Guard (100.100.101.101/102)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'ip route replace 100.100.101.101/32 via ${gw} dev ${dev} && ip route replace 100.100.101.102/32 via ${gw} dev ${dev}'
+ExecStop=/bin/sh -c 'ip route del 100.100.101.101/32 2>/dev/null || true; ip route del 100.100.101.102/32 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+RT_EOF
+
+    systemctl daemon-reload
+    systemctl enable edoh-isp-route >/dev/null 2>&1 || true
+    systemctl start edoh-isp-route >/dev/null 2>&1 || true
+    echo -e "${GREEN}  -> 静态路由已挂载并开启开机自启: 100.100.101.101/102 via ${gw} dev ${dev}${PLAIN}"
+    return 0
+}
+
+test_isp_api_port() {
+    echo -e "${CYAN}  -> 正在检测内网换 IP 控制器 (${ISP_API_PORT} 端口) 连通性 (不触发换 IP)...${PLAIN}"
+    local ok_cnt=0
+    for aip in "${ISP_API_IPS[@]}"; do
+        if curl -4 --noproxy "*" -sS --connect-timeout 2 --max-time 3 "http://${aip}:${ISP_API_PORT}/" -o /dev/null 2>&1 \
+            || curl -4 -v --noproxy "*" --connect-timeout 2 --max-time 3 "http://${aip}:${ISP_API_PORT}/" 2>&1 | grep -q "Connected to ${aip}"; then
+            echo -e "    ${GREEN}[OK]${PLAIN}   http://${aip}:${ISP_API_PORT} -> TCP 握手成功 (通道畅通)"
+            ok_cnt=$((ok_cnt + 1))
+        else
+            echo -e "    ${YELLOW}[WARN]${PLAIN} http://${aip}:${ISP_API_PORT} -> 连接超时或未启用"
+        fi
+    done
+    [ "$ok_cnt" -gt 0 ]
+}
+
+trigger_isp_changeip() {
+    echo -e "\n${DIV_BOLD}"
+    echo -e " ${CYAN}执行 TW 动态家宽 API 换 IP / Trigger ISP Dynamic IP Rotation${PLAIN}"
     echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 添加 / 更新 TW 商家内网 DNS 分流规则 (默认 DNS: 100.100.101.101,100.100.101.102)"
-    echo -e "  ${YELLOW}[2]${PLAIN} 测试内网 DNS (100.100.101.101) 连通性与解析结果"
-    echo -e "  ${RED}[3]${PLAIN} 清空所有内网私有分流规则"
+
+    enable_isp_route || return 1
+    local old_ip new_ip="" resp="" hit_api=""
+    old_ip=$(get_public_ipv4)
+    echo -e "  当前公网 IPv4 (Before) : ${YELLOW}${old_ip}${PLAIN}"
+
+    for aip in "${ISP_API_IPS[@]}"; do
+        echo -e "  -> 正在调用换 IP 接口: http://${aip}:${ISP_API_PORT}/changeip ..."
+        if resp=$(curl -4 --noproxy "*" -fsSL --connect-timeout 3 --max-time 15 "http://${aip}:${ISP_API_PORT}/changeip" 2>&1); then
+            hit_api="$aip"
+            break
+        elif curl -4 -v --noproxy "*" --connect-timeout 2 --max-time 5 "http://${aip}:${ISP_API_PORT}/changeip" 2>&1 | grep -q "Connected to ${aip}"; then
+            # 某些母鸡在收到 /changeip 瞬间即断开重拨导致空回复，属于正常触发
+            hit_api="$aip"
+            resp="Triggered (连接重拨切换中)"
+            break
+        fi
+    done
+
+    if [ -z "$hit_api" ]; then
+        echo -e "${RED}  [FAIL] 100.100.101.101 与 .102 接口均未响应，请确认当前机器是否为动态 IP 机型！${PLAIN}"
+        echo -e "${DIV_BOLD}"
+        return 1
+    fi
+
+    [ -n "$resp" ] && echo -e "  接口返回响应 (API Resp): ${GRAY}$(echo "$resp" | tr '\n' ' ' | cut -c1-60)${PLAIN}"
+    echo -e "${CYAN}  -> 等待上游重拨分配新公网 IP (约 3~8 秒)...${PLAIN}"
+
+    for _ in 1 2 3 4; do
+        sleep 2
+        new_ip=$(get_public_ipv4)
+        if [ "$new_ip" != "获取超时" ] && [ "$new_ip" != "$old_ip" ]; then
+            break
+        fi
+    done
+
+    if [ "$new_ip" != "获取超时" ] && [ "$new_ip" != "$old_ip" ]; then
+        echo -e "  ${GREEN}[OK] 换 IP 成功！公网 IPv4 已更新: ${YELLOW}${old_ip}${PLAIN} -> ${GREEN}${new_ip}${PLAIN}"
+    else
+        echo -e "  当前公网 IPv4 (After)  : ${CYAN}${new_ip}${PLAIN} (若处于商家冷却期内 IP 可能保持不变)"
+    fi
+    echo -e "${DIV_BOLD}"
+}
+
+remove_isp_route() {
+    systemctl stop edoh-isp-route 2>/dev/null || true
+    systemctl disable edoh-isp-route 2>/dev/null || true
+    rm -f "$ROUTE_SERVICE"
+    systemctl daemon-reload
+    for aip in "${ISP_API_IPS[@]}"; do
+        ip route del "${aip}/32" 2>/dev/null || true
+    done
+    echo -e "${GREEN}  [OK] 已移除 100.100.101.101/102 静态路由与开机自启服务！${PLAIN}"
+}
+
+manage_isp_changeip() {
+    local gw_dev gw dev cur_rt
+    gw_dev=$(get_wan_gw_dev)
+    gw="${gw_dev%%|*}"
+    dev="${gw_dev##*|}"
+    cur_rt=$(ip -4 route show 100.100.101.101/32 2>/dev/null | head -n1)
+
+    echo -e "\n${DIV_BOLD}"
+    echo -e " ${CYAN}TW 动态家宽换 IP 助手与路由守护 (HiNet / Seednet 100.100.101.x)${PLAIN}"
+    echo -e "${DIV_THIN}"
+    echo -e "  探测物理出口 : 网卡 ${CYAN}${dev:-未知}${PLAIN} | 内网网关 ${CYAN}${gw:-未知}${PLAIN}"
+    echo -e "  当前路由表项 : ${YELLOW}${cur_rt:-未配置专有静态路由 (默认走公网出口)}${PLAIN}"
+    echo -e "${DIV_THIN}"
+    echo -e "  ${GREEN}[1]${PLAIN} 一键挂载并开机固化 100.100.101.101/102 内网网关路由 (推荐必选)"
+    echo -e "  ${GREEN}[2]${PLAIN} 立即调用 API 换新 IP (自动请求 :8002/changeip 并对比前后公网 IP)"
+    echo -e "  ${CYAN}[3]${PLAIN} 仅测试 100.100.101.101/102:8002 端口握手连通性 (不换 IP)"
+    echo -e "  ${RED}[4]${PLAIN} 移除内网静态路由与开机守护"
     echo -e "  ${GRAY}[0]${PLAIN} 返回主菜单"
     echo -e "${DIV_THIN}"
-    local s_opt
-    read -rp "请选择操作 [0-3]: " s_opt </dev/tty
-    s_opt=$(echo "$s_opt" | tr -d '[:space:]')
-
-    case "$s_opt" in
-        1)
-            echo ""
-            read -rp "  1) 请输入换 IP API 域名或后缀 (多个用逗号隔开，如 api.xxx.com,lan): " in_doms </dev/tty
-            in_doms=$(echo "$in_doms" | tr -d '[:space:]')
-            if [ -z "$in_doms" ]; then
-                echo -e "${RED}  [Warn] 域名不能为空，如果不知道域名，请先查看你的换 IP 链接 URL！${PLAIN}"
-                return 1
-            fi
-            read -rp "  2) 请输入内网 DNS [回车默认 100.100.101.101,100.100.101.102]: " in_ips </dev/tty
-            in_ips=$(echo "$in_ips" | tr -d '[:space:]')
-            [ -z "$in_ips" ] && in_ips="100.100.101.101,100.100.101.102"
-
-            backup_configs
-            echo "${in_doms}|${in_ips}" > "$SPLIT_CONF"
-            if [ -f "$CONF_FILE" ]; then
-                inject_split_rules_to_yaml
-                systemctl is-active --quiet easy-doh && systemctl restart easy-doh
-                echo -e "\n${GREEN}  [OK] 分流规则已注入并热重启生效！正在实测分流域名解析...${PLAIN}"
-                local first_dom
-                first_dom=$(echo "${in_doms%%,*}" | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##')
-                local test_ip
-                test_ip=$(getent ahostsv4 "$first_dom" 2>/dev/null | awk '{print $1}' | head -n1)
-                if [ -n "$test_ip" ]; then
-                    echo -e "  ${GREEN}-> 实测成功: ${first_dom} -> ${test_ip}${PLAIN}"
-                else
-                    echo -e "  ${YELLOW}-> 提示: 若您填的是根后缀 (如 local)，请用完整 API 子域名实测。${PLAIN}"
-                fi
-            else
-                echo -e "\n${YELLOW}  [OK] 规则已保存！请接着执行主菜单 [1] 启动 DoH 服务即可自动生效。${PLAIN}"
-            fi
-            ;;
-        2)
-            local t_dom t_dns="100.100.101.101"
-            read -rp "  请输入要向 100.100.101.101 测试查询的 API 域名: " t_dom </dev/tty
-            t_dom=$(echo "$t_dom" | sed -E 's#^https?://##; s#/.*$##; s#:[0-9]+$##' | tr -d '[:space:]')
-            [ -z "$t_dom" ] && return 0
-            echo -e "${CYAN}  -> 正在直连 @100.100.101.101 与 @100.100.101.102 查询 ${t_dom} ...${PLAIN}"
-            for tip in 100.100.101.101 100.100.101.102; do
-                local ans=""
-                if command -v dig >/dev/null 2>&1; then
-                    ans=$(dig +short +time=2 +tries=1 @"${tip}" "$t_dom" A 2>/dev/null | paste -sd "," -)
-                elif command -v nslookup >/dev/null 2>&1; then
-                    ans=$(nslookup "$t_dom" "$tip" 2>/dev/null | awk '/^Address: / {print $2}' | paste -sd "," -)
-                fi
-                if [ -n "$ans" ]; then
-                    echo -e "    ${GREEN}[OK]${PLAIN} @${tip}:53 -> ${GREEN}${ans}${PLAIN}"
-                else
-                    echo -e "    ${RED}[FAIL]${PLAIN} @${tip}:53 -> 无返回或超时"
-                fi
-            done
-            ;;
-        3)
-            rm -f "$SPLIT_CONF"
-            if [ -f "$CONF_FILE" ]; then
-                sed -i '/"\[\/.*\/\]/d' "$CONF_FILE"
-                systemctl is-active --quiet easy-doh && systemctl restart easy-doh
-            fi
-            echo -e "\n${GREEN}  [OK] 已清空所有内网私有 DNS 分流规则！${PLAIN}"
-            ;;
+    local r_opt
+    read -rp "请选择操作 [0-4]: " r_opt </dev/tty
+    r_opt=$(echo "$r_opt" | tr -d '[:space:]')
+    case "$r_opt" in
+        1) echo ""; enable_isp_route && test_isp_api_port ;;
+        2) trigger_isp_changeip ;;
+        3) echo ""; test_isp_api_port ;;
+        4) echo ""; remove_isp_route ;;
     esac
 }
 
@@ -761,8 +800,26 @@ run_deploy_core() {
     echo -e "${CYAN}[3/4] 启动守护进程并锁定 /etc/resolv.conf...${PLAIN}"
     activate_doh_service || return 1
 
-    echo -e "${CYAN}[4/4] 检查 Docker 环境...${PLAIN}"
+    echo -e "${CYAN}[4/4] 检查 Docker 与台湾内网换 IP 路由环境...${PLAIN}"
     fix_docker_dns "$silent"
+
+    # 若选择台湾组且检测到内网网关存在 100.100.101.101:8002 控制器，自动挂载静态路由守护
+    if [[ "$mode" == tw* ]]; then
+        local gw_dev gw dev
+        gw_dev=$(get_wan_gw_dev)
+        gw="${gw_dev%%|*}"
+        dev="${gw_dev##*|}"
+        if [ -n "$gw" ] && [ -n "$dev" ]; then
+            ip route replace 100.100.101.101/32 via "$gw" dev "$dev" 2>/dev/null || true
+            if curl -4 --noproxy "*" -sS --connect-timeout 1.5 --max-time 2 "http://100.100.101.101:${ISP_API_PORT}/" -o /dev/null 2>&1 \
+                || curl -4 -v --noproxy "*" --connect-timeout 1.5 --max-time 2 "http://100.100.101.101:${ISP_API_PORT}/" 2>&1 | grep -q "Connected to 100.100.101.101"; then
+                enable_isp_route
+            else
+                [ ! -f "$ROUTE_SERVICE" ] && ip route del 100.100.101.101/32 2>/dev/null || true
+            fi
+        fi
+    fi
+
     test_all_dns
 }
 
@@ -771,7 +828,7 @@ deploy_doh_wizard() {
     echo -e " ${CYAN}选择分地区加密 DNS 负载均衡组 (自动预检剔除本机不可达节点)${PLAIN}"
     echo -e "${DIV_THIN}"
     echo -e "  ${GREEN}[1]${PLAIN} 全球自动优选组 (Global Auto)   : Quad9-ECS + CF + Google + DNS.SB + AdGuard [默认]"
-    echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体 (Taiwan Local)  : HiNet + Google(台湾) + CF(台北) + AdGuard + DNS.SB"
+    echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体 (Taiwan Local)  : HiNet + Google(台湾) + CF(台北) + AdGuard + 自动换IP路由"
     echo -e "  ${GREEN}[3]${PLAIN} 亚太新港日优化 (HK / JP / SG)  : DNS.SB + AdGuard + 日本IIJ + CF + Google"
     echo -e "  ${GREEN}[4]${PLAIN} 欧洲纯 IP 专线 (UK / DE / NL)  : Quad9-ECS + CF + Mullvad(194.242) + DNS.SB"
     echo -e "  ${GREEN}[5]${PLAIN} 北美专线极速组 (US / CA)       : Quad9-ECS + CF + OpenDNS + ControlD(p0)"
@@ -940,7 +997,7 @@ audit_leaks() {
     local hits
     hits=$(grep -rnE '1\.1\.1\.1|8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9|168\.95\.1\.1|139\.175\.|10\.30\.' \
         /etc/ /opt/ /root/ /usr/local/etc/ /var/lib/ 2>/dev/null \
-        | grep -vE '/etc/easy-doh|/usr/local/bin/doh|99-native-dot|\.bak|\.orig|hosts|resolv\.conf|journal|\.log|overlay2|https://|tls://|quic://' \
+        | grep -vE '/etc/easy-doh|/usr/local/bin/doh|edoh-isp-route|99-native-dot|\.bak|\.orig|hosts|resolv\.conf|journal|\.log|overlay2|https://|tls://|quic://' \
         | grep -E '\.(json|yaml|yml|toml|conf|ini|service):' | head -n 20 || true)
     if [ -z "$hits" ]; then
         echo -e "     ${GREEN}[OK] 未发现写死明文公共 53 DNS 的配置文件！${PLAIN}"
@@ -950,7 +1007,7 @@ audit_leaks() {
 
     echo -e "\n ${YELLOW}[3] 实时外部 53 端口连接抓捕 (Live Outbound Port 53 Sockets):${PLAIN}"
     local live_53
-    live_53=$(ss -tunap 2>/dev/null | awk '$5 ~ /:53$/ && $5 !~ /127\.0\.0\.|172\.17\.0\.1|100\.100\.101\.|\*:53|0\.0\.0\.0:53|\[::\]:53/' || true)
+    live_53=$(ss -tunap 2>/dev/null | awk '$5 ~ /:53$/ && $5 !~ /127\.0\.0\.|172\.17\.0\.1|\*:53|0\.0\.0\.0:53|\[::\]:53/' || true)
     if [ -z "$live_53" ]; then
         echo -e "     ${GREEN}[OK] 完美！当前没有任何进程向公网 53 端口发起连接。${PLAIN}"
     else
@@ -1021,12 +1078,17 @@ update_self_and_core() {
 purge_core() {
     local remove_self="${1:-0}"
 
-    echo -e "\n${CYAN}[1/4] 停止并移除加密 DNS 守护进程与全部历史日志...${PLAIN}"
+    echo -e "\n${CYAN}[1/4] 停止并移除加密 DNS 守护进程、换 IP 路由服务与历史日志...${PLAIN}"
     systemctl stop easy-doh 2>/dev/null || true
     systemctl disable easy-doh 2>/dev/null || true
+    systemctl stop edoh-isp-route 2>/dev/null || true
+    systemctl disable edoh-isp-route 2>/dev/null || true
     systemctl stop doh-proxy 2>/dev/null || true
     systemctl disable doh-proxy 2>/dev/null || true
-    rm -f "$SERVICE_FILE" /etc/systemd/system/doh-proxy.service /etc/default/doh-proxy
+    for aip in "${ISP_API_IPS[@]}"; do
+        ip route del "${aip}/32" 2>/dev/null || true
+    done
+    rm -f "$SERVICE_FILE" "$ROUTE_SERVICE" /etc/systemd/system/doh-proxy.service /etc/default/doh-proxy
     rm -f /etc/systemd/resolved.conf.d/99-easy-doh.conf \
           /etc/systemd/resolved.conf.d/99-native-dot.conf \
           /etc/systemd/resolved.conf.d/nodnsstub.conf
@@ -1054,16 +1116,16 @@ purge_core() {
     echo -e "${CYAN}[3/4] 清理 Docker 网桥注入规则与防火墙策略...${PLAIN}"
     revert_docker_dns
 
-    echo -e "${CYAN}[4/4] 彻底清空所有备份归档、分流规则与二进制内核...${PLAIN}"
+    echo -e "${CYAN}[4/4] 彻底清空所有备份归档、缓存状态与二进制内核...${PLAIN}"
     rm -rf "$WORK_DIR"
     rm -f "$BIN_PATH" "${BIN_PATH}.new" /etc/resolv.conf.doh.bak /tmp/doh_bench_*
 
     if [ "$remove_self" -eq 1 ]; then
         rm -f "$SCRIPT_PATH" "${SCRIPT_PATH}.new" "${SCRIPT_PATH}.tmp"
-        echo -e "\n${GREEN}[OK] 已完成 100% 零残留彻底卸载（包含所有备份、日志、内核与 doh 命令本身）！${PLAIN}\n"
+        echo -e "\n${GREEN}[OK] 已完成 100% 零残留彻底卸载（包含所有备份、路由、内核与 doh 命令本身）！${PLAIN}\n"
         exit 0
     else
-        echo -e "\n${GREEN}[OK] 服务、内核、日志与全部历史备份已彻底清空！(仅保留 doh 管理脚本)${PLAIN}"
+        echo -e "\n${GREEN}[OK] 服务、内核、路由与全部历史备份已彻底清空！(仅保留 doh 管理脚本)${PLAIN}"
     fi
 }
 
@@ -1071,7 +1133,7 @@ uninstall_all() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}彻底卸载与无痕清理 / Complete Uninstall & Zero-Trace Purge${PLAIN}"
     echo -e "${DIV_THIN}"
-    echo -e "  ${YELLOW}[1]${PLAIN} 卸载服务 + 还原 DNS + ${RED}清空所有备份与内核${PLAIN} (保留 doh 命令备用)"
+    echo -e "  ${YELLOW}[1]${PLAIN} 卸载服务 + 还原 DNS + ${RED}清空所有备份/路由/内核${PLAIN} (保留 doh 命令备用)"
     echo -e "  ${RED}[2]${PLAIN} 100% 零残留彻底抹除 (${RED}连同 /usr/local/bin/doh 脚本一起自毁删除${PLAIN})"
     echo -e "  ${GRAY}[0]${PLAIN} 取消返回 (Cancel)"
     echo -e "${DIV_THIN}"
@@ -1103,11 +1165,16 @@ render_menu() {
         listen_str="127.0.0.53:53 (TCP + UDP)"
     fi
 
-    local split_str="${GRAY}Disabled (未启用)${PLAIN}"
-    if [ -s "$SPLIT_CONF" ]; then
-        local s_dom s_ip
-        IFS='|' read -r s_dom s_ip < "$SPLIT_CONF"
-        split_str="${GREEN}[/${s_dom}/] -> ${s_ip}${PLAIN}"
+    local rt_str="${GRAY}Disabled (非动态家宽无需开启)${PLAIN}"
+    local rt_line
+    rt_line=$(ip -4 route show 100.100.101.101/32 2>/dev/null | head -n1)
+    if echo "$rt_line" | grep -q "via "; then
+        local r_gw r_dev
+        r_gw=$(echo "$rt_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+        r_dev=$(echo "$rt_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+        rt_str="${GREEN}Protected (100.100.101.101/102 via ${r_gw} dev ${r_dev})${PLAIN}"
+    elif [ -n "$rt_line" ]; then
+        rt_str="${YELLOW}Invalid Scope (${rt_line} - 请按 [3]->[1] 修复)${PLAIN}"
     fi
 
     local lock_str="${YELLOW}Unlocked (未锁定)${PLAIN}"
@@ -1134,13 +1201,13 @@ render_menu() {
     echo -e "  运行状态 Engine   : ${eng_str}"
     echo -e "  监听端点 Listen   : ${listen_str}"
     echo -e "  上游策略 Upstream : ${CYAN}${up_str}${PLAIN}"
-    echo -e "  内网分流 SplitDNS : ${split_str}"
+    echo -e "  换IP路由 ISPRoute : ${rt_str}"
     echo -e "  系统锁定 Resolv   : ${lock_str}  [备份 Backups: ${bak_cnt}/3]"
     echo -e "  容器环境 Docker   : ${dk_str}"
     echo -e "${DIV_THIN}"
     echo -e "  ${GREEN}[1]${PLAIN} 安装 / 切换分地区 DoH 策略    (Install / Switch Regional DoH)"
     echo -e "  ${GREEN}[2]${PLAIN} 启用系统原生 DoT 急救模式     (Enable Native DoT 853)"
-    echo -e "  ${GREEN}[3]${PLAIN} 商家内网 DNS 分流 (TW换IP专用)(ISP Split-DNS 100.100.101.x)"
+    echo -e "  ${GREEN}[3]${PLAIN} TW 动态换 IP 与内网路由守护   (TW ChangeIP & 100.100.101.x Route)"
     echo -e "  ${GREEN}[4]${PLAIN} 修复 Docker 容器 DNS 防回退   (Fix Docker Bridge DNS)"
     echo -e "  ${GREEN}[5]${PLAIN} 实测本地 DNS 解析 (IPv4/IPv6) (Test Local DNS Resolution)"
     echo -e "  ${GREEN}[6]${PLAIN} 全球 12 大 DoH 并发测速排行   (Global DoH Upstream Speedtest)"
@@ -1153,20 +1220,20 @@ render_menu() {
     echo -e "${DIV_BOLD}"
 }
 
-# CLI 非交互自动化支持: doh --split "api.xxx.com" "100.100.101.101,100.100.101.102"
+# CLI 非交互快捷参数: doh --changeip | doh --route-isp | doh --auto tw | doh --purge
 case "${1:-}" in
     --auto)
         cp -f "$0" "$SCRIPT_PATH" 2>/dev/null && chmod +x "$SCRIPT_PATH"
         run_deploy_core "${2:-global}" "" "" 1
         exit $?
         ;;
-    --split)
-        mkdir -p "$WORK_DIR"
-        [ -n "${2:-}" ] && echo "${2}|${3:-100.100.101.101,100.100.101.102}" > "$SPLIT_CONF"
-        inject_split_rules_to_yaml
-        systemctl is-active --quiet easy-doh && systemctl restart easy-doh
-        echo "[OK] Split-DNS rule applied: [/${2}/] -> ${3:-100.100.101.101,100.100.101.102}"
-        exit 0
+    --route-isp)
+        enable_isp_route && test_isp_api_port
+        exit $?
+        ;;
+    --changeip)
+        trigger_isp_changeip
+        exit $?
         ;;
     --purge)
         purge_core 1
@@ -1193,7 +1260,7 @@ while true; do
     case "$choice" in
         1) deploy_doh_wizard; pause_return ;;
         2) enable_native_dot; pause_return ;;
-        3) manage_split_dns; pause_return ;;
+        3) manage_isp_changeip; pause_return ;;
         4) fix_docker_dns 0; pause_return ;;
         5) test_all_dns; pause_return ;;
         6) benchmark_global_upstreams; pause_return ;;
