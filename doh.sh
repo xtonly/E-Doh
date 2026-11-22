@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Project   : E-Doh Manager (v3.0 Release)
+# Project   : E-Doh Manager (v3.1 Release)
 # Repo      : https://github.com/xtonly/E-Doh
 # Features  : Dead-Node Auto-Prune | Multi-API Bootstrap | Docker Guard | Purge
 # Usage     : Interactive -> doh | CLI -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
 # ==============================================================================
 
-VERSION="3.0"
+VERSION="3.1"
 GH_REPO="xtonly/E-Doh"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
@@ -45,7 +45,6 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 多路纯 IP DoH 容灾解析 (防 1.1.1.1 / 8.8.8.8 被黑洞的环境)
 doh_lookup_ip() {
     local domain="$1" ip=""
     local apis=(
@@ -63,7 +62,6 @@ doh_lookup_ip() {
     echo "$ip"
 }
 
-# 快速探测单个 DoH 节点是否存活
 probe_doh_alive() {
     local url="$1" b_ip="${2:-}" host rip res_arg=() code
     host=$(echo "$url" | awk -F/ '{print $3}')
@@ -82,10 +80,10 @@ probe_doh_alive() {
     [ "$code" = "200" ]
 }
 
-# 自动优选本机存活的单一纯 IP Bootstrap
+# 优选最稳定的纯 IP Bootstrap (优先 Google/CF/AdGuard，避开对特殊记录偶发丢包的 TWNIC)
 pick_best_bootstrap() {
     local prefer="$1"
-    local candidates=("$prefer" "101.101.101.101" "94.140.14.140" "185.222.222.222" "8.8.8.8" "1.1.1.1" "223.5.5.5")
+    local candidates=("$prefer" "8.8.8.8" "1.1.1.1" "94.140.14.140" "185.222.222.222" "101.101.101.101" "223.5.5.5")
     local seen="" ip code
     for ip in "${candidates[@]}"; do
         [ -z "$ip" ] && continue
@@ -102,7 +100,6 @@ pick_best_bootstrap() {
     echo "94.140.14.140"
 }
 
-# 支持免 DNS 环境拉取远程脚本 (GitHub 主源附带防缓存参数，失败自动切换 Cloudflare jsDelivr)
 fetch_remote_script() {
     local target="$1" url fetch_url host rip res_arg=()
     for url in "${RAW_URLS[@]}"; do
@@ -270,14 +267,15 @@ write_doh_config() {
     case "$mode" in
         tw|tw_opt)
             group_label="TW Local"
-            pref_boot="101.101.101.101"
+            pref_boot="8.8.8.8"
+            # 台湾组优先使用全记录类型 100% 兼容的 HiNet + Google(彰化) + CF(台北) + AdGuard + DNS.SB
+            # (避免 TWNIC 101.101.101.101 遇到 _https._tcp SVCB 查询时偶发 3s 超时日志)
             candidates=(
-                "TWNIC|https://101.101.101.101/dns-query"
                 "HiNet|https://dns.hinet.net/dns-query"
-                "AdGuard|https://94.140.14.140/dns-query"
-                "DNS.SB|https://185.222.222.222/dns-query"
                 "Google|https://8.8.8.8/dns-query"
                 "CF|https://1.1.1.1/dns-query"
+                "AdGuard|https://94.140.14.140/dns-query"
+                "DNS.SB|https://185.222.222.222/dns-query"
             )
             ;;
         apac|apac_opt)
@@ -325,7 +323,7 @@ write_doh_config() {
             ;;
         custom)
             group_label="Custom DoH"
-            pref_boot="101.101.101.101"
+            pref_boot="94.140.14.140"
             candidates=(
                 "Primary|${custom_u1}"
                 "Secondary|${custom_u2}"
@@ -361,8 +359,18 @@ write_doh_config() {
         fi
     done
 
+    # 若台湾组遇到 Google/CF/AdGuard 全被黑洞的极端情况，自动补入 TWNIC 101.101.101.101 救场
+    if [[ "$mode" == tw* ]] && [ ${#alive_urls[@]} -lt 2 ]; then
+        if probe_doh_alive "https://101.101.101.101/dns-query" "$boot_ip"; then
+            alive_urls+=("https://101.101.101.101/dns-query")
+            alive_names+=("TWNIC")
+        fi
+    fi
+
     if [ ${#dead_names[@]} -gt 0 ]; then
-        echo -e "${YELLOW}  -> [避坑] 已自动剔除本机超时的黑洞节点: $(IFS=', '; echo "${dead_names[*]}")${PLAIN}"
+        local dead_str
+        dead_str=$(printf "%s, " "${dead_names[@]}")
+        echo -e "${YELLOW}  -> [避坑] 已自动剔除本机超时的黑洞节点: ${dead_str%, }${PLAIN}"
     fi
 
     if [ ${#alive_urls[@]} -eq 0 ]; then
@@ -371,7 +379,8 @@ write_doh_config() {
     fi
 
     local joined_names
-    joined_names=$(IFS=' + '; echo "${alive_names[*]}")
+    joined_names=$(printf "%s + " "${alive_names[@]}")
+    joined_names="${joined_names% + }"
     echo "${group_label} (${joined_names})" > "$STATE_FILE"
     echo -e "${GREEN}  -> 已启用存活节点: ${joined_names} (Bootstrap: ${boot_ip})${PLAIN}"
 
@@ -565,8 +574,8 @@ enable_native_dot() {
     mkdir -p /etc/systemd/resolved.conf.d
     cat << 'DOT_EOF' > /etc/systemd/resolved.conf.d/99-native-dot.conf
 [Resolve]
-DNS=101.101.101.101#dns.twnic.tw 94.140.14.140#unfiltered.adguard-dns.com 185.222.222.222#dns.sb
-FallbackDNS=1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google
+DNS=94.140.14.140#unfiltered.adguard-dns.com 185.222.222.222#dns.sb 1.1.1.1#cloudflare-dns.com
+FallbackDNS=8.8.8.8#dns.google 101.101.101.101#dns.twnic.tw
 DNSOverTLS=yes
 DNSStubListener=yes
 Cache=yes
@@ -606,7 +615,7 @@ deploy_doh_wizard() {
     echo -e " ${CYAN}选择分地区加密 DNS 负载均衡组 (自动预检剔除本机不可达节点)${PLAIN}"
     echo -e "${DIV_THIN}"
     echo -e "  ${GREEN}[1]${PLAIN} 全球自动优选组 (Global Auto)   : Quad9-ECS + CF + Google + DNS.SB + AdGuard [默认]"
-    echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体 (Taiwan Local)  : TWNIC(101.101) + HiNet + AdGuard + DNS.SB"
+    echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体 (Taiwan Local)  : HiNet + Google(台湾) + CF(台北) + AdGuard + DNS.SB"
     echo -e "  ${GREEN}[3]${PLAIN} 亚太新港日优化 (HK / JP / SG)  : DNS.SB + AdGuard + 日本IIJ + CF + Google"
     echo -e "  ${GREEN}[4]${PLAIN} 欧洲纯 IP 专线 (UK / DE / NL)  : Quad9-ECS + CF + Mullvad(194.242) + DNS.SB"
     echo -e "  ${GREEN}[5]${PLAIN} 北美专线极速组 (US / CA)       : Quad9-ECS + CF + OpenDNS + ControlD(p0)"
@@ -624,7 +633,7 @@ deploy_doh_wizard() {
         6) mode="cn_opt" ;;
         7)
             mode="custom"
-            read -rp "  请输入主加密 DNS (如 https://101.101.101.101/dns-query): " c1 </dev/tty
+            read -rp "  请输入主加密 DNS (如 https://dns.hinet.net/dns-query): " c1 </dev/tty
             [ -z "$c1" ] && echo -e "${YELLOW}输入为空，已取消。${PLAIN}" && return 0
             read -rp "  请输入备加密 DNS (回车默认 https://94.140.14.140/dns-query): " c2 </dev/tty
             [ -z "$c2" ] && c2="https://94.140.14.140/dns-query"
@@ -794,15 +803,16 @@ audit_leaks() {
     echo -e "${DIV_BOLD}"
 }
 
+# 按 systemd 唯一实例 ID (_SYSTEMD_INVOCATION_ID) 精准过滤当前进程日志，彻底杜绝上一秒旧进程日志混入
 show_live_logs() {
     echo -e "\n${DIV_BOLD}"
     echo -e " ${CYAN}当前实例运行日志 / Current Service Instance Logs${PLAIN}"
     echo -e "${DIV_THIN}"
     if systemctl is-active --quiet easy-doh; then
-        local since_ts
-        since_ts=$(systemctl show easy-doh -p ActiveEnterTimestamp --value 2>/dev/null)
-        if [ -n "$since_ts" ]; then
-            journalctl -u easy-doh --since "$since_ts" -n 30 --no-pager
+        local inv_id
+        inv_id=$(systemctl show easy-doh -p InvocationID --value 2>/dev/null)
+        if [ -n "$inv_id" ]; then
+            journalctl _SYSTEMD_INVOCATION_ID="$inv_id" -n 30 --no-pager
         else
             journalctl -u easy-doh -n 25 --no-pager
         fi
