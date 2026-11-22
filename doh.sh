@@ -1,13 +1,13 @@
 cat << 'EOF' > /usr/local/bin/doh
 #!/usr/bin/env bash
 # ==============================================================================
-# Project   : E-Doh Manager (v3.4 Release)
+# Project   : E-Doh Manager (v3.5 Release)
 # Repo      : https://github.com/xtonly/E-Doh
-# Features  : TW 100.100.101.x Route & ChangeIP | Auto-Prune DoH | Docker Guard
+# Features  : Multi-Level TUI Loop | TW ChangeIP & Route | Auto-Prune | Purge
 # Usage     : doh | doh --auto [global|tw|apac|eu|na|cn] | doh --changeip | doh --purge
 # ==============================================================================
 
-VERSION="3.4"
+VERSION="3.5"
 GH_REPO="xtonly/E-Doh"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
@@ -140,9 +140,16 @@ bootstrap_self() {
     fi
 }
 
+# 一级单步功能专用：执行完返回主菜单
 pause_return() {
     echo ""
-    read -rp "按回车键返回主菜单 / Press Enter to return..." _ </dev/tty
+    read -rp "按回车键返回主菜单 / Press Enter to return to main menu..." _ </dev/tty
+}
+
+# 二级子菜单功能专用：执行完返回当前所属子菜单
+pause_submenu() {
+    echo ""
+    read -rp "按回车键返回上一级菜单 / Press Enter to go back..." _ </dev/tty
 }
 
 save_orig_resolv() {
@@ -179,7 +186,6 @@ get_docker_ip() {
     fi
 }
 
-# 提取物理主网卡与内网网关 (排除 tun/wg/docker/mihomo 等虚拟接口干扰)
 get_wan_gw_dev() {
     local line gw dev
     line=$(ip -4 route show table main default 2>/dev/null | grep -vE 'dev (tun|tap|wg|utun|docker|br-|veth|tailscale|clash|mihomo|sing)' | head -n1)
@@ -439,6 +445,13 @@ YAML_FB
 # ==============================================================================
 # TW HiNet / Seednet 内网换 IP 静态路由守护与一键重拨模块 (100.100.101.101/102:8002)
 # ==============================================================================
+# 零杂音探测 :8002 端口 TCP 握手 (退出码 0 或 52 Empty reply 均表示 TCP 已握手连通)
+probe_tcp_8002() {
+    local target_ip="$1" ec=0
+    curl -4 --noproxy "*" -s -o /dev/null --connect-timeout 2 --max-time 3 "http://${target_ip}:${ISP_API_PORT}/" 2>/dev/null || ec=$?
+    [ "$ec" -eq 0 ] || [ "$ec" -eq 52 ]
+}
+
 enable_isp_route() {
     local gw_dev gw dev
     gw_dev=$(get_wan_gw_dev)
@@ -454,7 +467,6 @@ enable_isp_route() {
         ip route replace "${aip}/32" via "$gw" dev "$dev"
     done
 
-    # 写入 systemd 开机自启守护，防止重启或网卡重置丢失 100.100.101.x 路由
     cat << RT_EOF > "$ROUTE_SERVICE"
 [Unit]
 Description=E-Doh TW ISP ChangeIP Static Route Guard (100.100.101.101/102)
@@ -479,15 +491,14 @@ RT_EOF
 }
 
 test_isp_api_port() {
-    echo -e "${CYAN}  -> 正在检测内网换 IP 控制器 (${ISP_API_PORT} 端口) 连通性 (不触发换 IP)...${PLAIN}"
+    echo -e "${CYAN}  -> 正在静默检测内网换 IP 控制器 (${ISP_API_PORT} 端口) 连通性 (不触发换 IP)...${PLAIN}"
     local ok_cnt=0
     for aip in "${ISP_API_IPS[@]}"; do
-        if curl -4 --noproxy "*" -sS --connect-timeout 2 --max-time 3 "http://${aip}:${ISP_API_PORT}/" -o /dev/null 2>&1 \
-            || curl -4 -v --noproxy "*" --connect-timeout 2 --max-time 3 "http://${aip}:${ISP_API_PORT}/" 2>&1 | grep -q "Connected to ${aip}"; then
-            echo -e "    ${GREEN}[OK]${PLAIN}   http://${aip}:${ISP_API_PORT} -> TCP 握手成功 (通道畅通)"
+        if probe_tcp_8002 "$aip"; then
+            echo -e "    ${GREEN}[OK]${PLAIN}   http://${aip}:${ISP_API_PORT} -> TCP 握手成功 (换 IP 通道畅通)"
             ok_cnt=$((ok_cnt + 1))
         else
-            echo -e "    ${YELLOW}[WARN]${PLAIN} http://${aip}:${ISP_API_PORT} -> 连接超时或未启用"
+            echo -e "    ${GRAY}[SKIP]${PLAIN} http://${aip}:${ISP_API_PORT} -> 备用节点未启用或不可达"
         fi
     done
     [ "$ok_cnt" -gt 0 ]
@@ -499,19 +510,17 @@ trigger_isp_changeip() {
     echo -e "${DIV_THIN}"
 
     enable_isp_route || return 1
-    local old_ip new_ip="" resp="" hit_api=""
+    local old_ip new_ip="" resp="" hit_api="" ec=0
     old_ip=$(get_public_ipv4)
     echo -e "  当前公网 IPv4 (Before) : ${YELLOW}${old_ip}${PLAIN}"
 
     for aip in "${ISP_API_IPS[@]}"; do
         echo -e "  -> 正在调用换 IP 接口: http://${aip}:${ISP_API_PORT}/changeip ..."
-        if resp=$(curl -4 --noproxy "*" -fsSL --connect-timeout 3 --max-time 15 "http://${aip}:${ISP_API_PORT}/changeip" 2>&1); then
+        ec=0
+        resp=$(curl -4 --noproxy "*" -fsSL --connect-timeout 3 --max-time 15 "http://${aip}:${ISP_API_PORT}/changeip" 2>/dev/null) || ec=$?
+        if [ "$ec" -eq 0 ] || [ "$ec" -eq 52 ] || [ "$ec" -eq 56 ]; then
             hit_api="$aip"
-            break
-        elif curl -4 -v --noproxy "*" --connect-timeout 2 --max-time 5 "http://${aip}:${ISP_API_PORT}/changeip" 2>&1 | grep -q "Connected to ${aip}"; then
-            # 某些母鸡在收到 /changeip 瞬间即断开重拨导致空回复，属于正常触发
-            hit_api="$aip"
-            resp="Triggered (连接重拨切换中)"
+            [ -z "$resp" ] && resp="Triggered (接口已受理，重拨切换中)"
             break
         fi
     done
@@ -522,7 +531,7 @@ trigger_isp_changeip() {
         return 1
     fi
 
-    [ -n "$resp" ] && echo -e "  接口返回响应 (API Resp): ${GRAY}$(echo "$resp" | tr '\n' ' ' | cut -c1-60)${PLAIN}"
+    echo -e "  接口返回响应 (API Resp): ${GRAY}$(echo "$resp" | tr '\n' ' ' | cut -c1-60)${PLAIN}"
     echo -e "${CYAN}  -> 等待上游重拨分配新公网 IP (约 3~8 秒)...${PLAIN}"
 
     for _ in 1 2 3 4; do
@@ -552,34 +561,53 @@ remove_isp_route() {
     echo -e "${GREEN}  [OK] 已移除 100.100.101.101/102 静态路由与开机自启服务！${PLAIN}"
 }
 
+# 二级子菜单 [3]：独立循环驻留，按 0 返回主菜单
 manage_isp_changeip() {
-    local gw_dev gw dev cur_rt
-    gw_dev=$(get_wan_gw_dev)
-    gw="${gw_dev%%|*}"
-    dev="${gw_dev##*|}"
-    cur_rt=$(ip -4 route show 100.100.101.101/32 2>/dev/null | head -n1)
+    while true; do
+        local gw_dev gw dev cur_rt rt_display
+        gw_dev=$(get_wan_gw_dev)
+        gw="${gw_dev%%|*}"
+        dev="${gw_dev##*|}"
+        cur_rt=$(ip -4 route show 100.100.101.101/32 2>/dev/null | head -n1)
 
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}TW 动态家宽换 IP 助手与路由守护 (HiNet / Seednet 100.100.101.x)${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e "  探测物理出口 : 网卡 ${CYAN}${dev:-未知}${PLAIN} | 内网网关 ${CYAN}${gw:-未知}${PLAIN}"
-    echo -e "  当前路由表项 : ${YELLOW}${cur_rt:-未配置专有静态路由 (默认走公网出口)}${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 一键挂载并开机固化 100.100.101.101/102 内网网关路由 (推荐必选)"
-    echo -e "  ${GREEN}[2]${PLAIN} 立即调用 API 换新 IP (自动请求 :8002/changeip 并对比前后公网 IP)"
-    echo -e "  ${CYAN}[3]${PLAIN} 仅测试 100.100.101.101/102:8002 端口握手连通性 (不换 IP)"
-    echo -e "  ${RED}[4]${PLAIN} 移除内网静态路由与开机守护"
-    echo -e "  ${GRAY}[0]${PLAIN} 返回主菜单"
-    echo -e "${DIV_THIN}"
-    local r_opt
-    read -rp "请选择操作 [0-4]: " r_opt </dev/tty
-    r_opt=$(echo "$r_opt" | tr -d '[:space:]')
-    case "$r_opt" in
-        1) echo ""; enable_isp_route && test_isp_api_port ;;
-        2) trigger_isp_changeip ;;
-        3) echo ""; test_isp_api_port ;;
-        4) echo ""; remove_isp_route ;;
-    esac
+        if echo "$cur_rt" | grep -q "via "; then
+            rt_display="${GREEN}${cur_rt} (已保护)${PLAIN}"
+        elif [ -n "$cur_rt" ]; then
+            rt_display="${YELLOW}${cur_rt} (异常作用域，请按 [1] 修复)${PLAIN}"
+        else
+            rt_display="${GRAY}未配置专有静态路由 (默认走公网出口)${PLAIN}"
+        fi
+
+        clear
+        echo -e "${DIV_BOLD}"
+        echo -e " ${CYAN}TW 动态家宽换 IP 助手与路由守护 (HiNet / Seednet 100.100.101.x)${PLAIN}"
+        echo -e "${DIV_BOLD}"
+        echo -e "  探测物理出口 : 网卡 ${CYAN}${dev:-未知}${PLAIN} | 内网网关 ${CYAN}${gw:-未知}${PLAIN}"
+        echo -e "  当前路由状态 : ${rt_display}"
+        echo -e "${DIV_THIN}"
+        echo -e "  ${GREEN}[1]${PLAIN} 一键挂载并开机固化 100.100.101.101/102 内网网关路由 (推荐必选)"
+        echo -e "  ${GREEN}[2]${PLAIN} 立即调用 API 换新 IP (自动请求 :8002/changeip 并对比前后公网 IP)"
+        echo -e "  ${GREEN}[3]${PLAIN} 仅测试 100.100.101.101/102:8002 端口握手连通性 (不换 IP)"
+        echo -e "  ${GREEN}[4]${PLAIN} 移除内网静态路由与开机守护"
+        echo -e "  ${GREEN}[0]${PLAIN} 返回主菜单 (Back to Main Menu)"
+        echo -e "${DIV_BOLD}"
+        local r_opt
+        read -rp "请选择操作编号 / Select option [0-4]: " r_opt </dev/tty
+        r_opt=$(echo "$r_opt" | tr -d '[:space:]')
+        [ -z "$r_opt" ] && continue
+
+        case "$r_opt" in
+            0) return 0 ;;
+            1) echo ""; enable_isp_route && test_isp_api_port; pause_submenu ;;
+            2) trigger_isp_changeip; pause_submenu ;;
+            3) echo ""; test_isp_api_port; pause_submenu ;;
+            4) echo ""; remove_isp_route; pause_submenu ;;
+            *)
+                echo -e "\n${RED}[Warn] 无效选项 '${r_opt}'，请输入 0-4 之间的数字！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 activate_doh_service() {
@@ -803,7 +831,6 @@ run_deploy_core() {
     echo -e "${CYAN}[4/4] 检查 Docker 与台湾内网换 IP 路由环境...${PLAIN}"
     fix_docker_dns "$silent"
 
-    # 若选择台湾组且检测到内网网关存在 100.100.101.101:8002 控制器，自动挂载静态路由守护
     if [[ "$mode" == tw* ]]; then
         local gw_dev gw dev
         gw_dev=$(get_wan_gw_dev)
@@ -811,8 +838,7 @@ run_deploy_core() {
         dev="${gw_dev##*|}"
         if [ -n "$gw" ] && [ -n "$dev" ]; then
             ip route replace 100.100.101.101/32 via "$gw" dev "$dev" 2>/dev/null || true
-            if curl -4 --noproxy "*" -sS --connect-timeout 1.5 --max-time 2 "http://100.100.101.101:${ISP_API_PORT}/" -o /dev/null 2>&1 \
-                || curl -4 -v --noproxy "*" --connect-timeout 1.5 --max-time 2 "http://100.100.101.101:${ISP_API_PORT}/" 2>&1 | grep -q "Connected to 100.100.101.101"; then
+            if probe_tcp_8002 "100.100.101.101"; then
                 enable_isp_route
             else
                 [ ! -f "$ROUTE_SERVICE" ] && ip route del 100.100.101.101/32 2>/dev/null || true
@@ -823,38 +849,64 @@ run_deploy_core() {
     test_all_dns
 }
 
+# 二级子菜单 [1]：独立循环驻留，补齐 [0] 返回主菜单，防止误按 0 覆盖配置
 deploy_doh_wizard() {
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}选择分地区加密 DNS 负载均衡组 (自动预检剔除本机不可达节点)${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 全球自动优选组 (Global Auto)   : Quad9-ECS + CF + Google + DNS.SB + AdGuard [默认]"
-    echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体 (Taiwan Local)  : HiNet + Google(台湾) + CF(台北) + AdGuard + 自动换IP路由"
-    echo -e "  ${GREEN}[3]${PLAIN} 亚太新港日优化 (HK / JP / SG)  : DNS.SB + AdGuard + 日本IIJ + CF + Google"
-    echo -e "  ${GREEN}[4]${PLAIN} 欧洲纯 IP 专线 (UK / DE / NL)  : Quad9-ECS + CF + Mullvad(194.242) + DNS.SB"
-    echo -e "  ${GREEN}[5]${PLAIN} 北美专线极速组 (US / CA)       : Quad9-ECS + CF + OpenDNS + ControlD(p0)"
-    echo -e "  ${GREEN}[6]${PLAIN} 中国大陆防限速 (CN Mainland)   : 阿里DoH + 腾讯doh.pub + 360DoH 负载均衡"
-    echo -e "  ${GREEN}[7]${PLAIN} 自定义加密上游 (Custom URL)    : 手动输入主/备 DoH 或 DoT 地址"
-    echo -e "${DIV_THIN}"
-    local up_opt mode="global" c1="" c2=""
-    read -rp "请选择策略 [1-7, 回车默认 1]: " up_opt </dev/tty
-    up_opt=$(echo "$up_opt" | tr -d '[:space:]')
-    case "$up_opt" in
-        2) mode="tw_opt" ;;
-        3) mode="apac_opt" ;;
-        4) mode="eu_opt" ;;
-        5) mode="na_opt" ;;
-        6) mode="cn_opt" ;;
-        7)
-            mode="custom"
-            read -rp "  请输入主加密 DNS (如 https://dns.hinet.net/dns-query): " c1 </dev/tty
-            [ -z "$c1" ] && echo -e "${YELLOW}输入为空，已取消。${PLAIN}" && return 0
-            read -rp "  请输入备加密 DNS (回车默认 https://94.140.14.140/dns-query): " c2 </dev/tty
-            [ -z "$c2" ] && c2="https://94.140.14.140/dns-query"
-            ;;
-        *) mode="global" ;;
-    esac
-    echo ""
-    run_deploy_core "$mode" "$c1" "$c2" 0
+    while true; do
+        local cur_up="None (未配置)"
+        [ -f "$STATE_FILE" ] && cur_up=$(cat "$STATE_FILE")
+
+        clear
+        echo -e "${DIV_BOLD}"
+        echo -e " ${CYAN}安装 / 切换分地区 DoH 策略 (自动预检剔除本机不可达节点)${PLAIN}"
+        echo -e "${DIV_BOLD}"
+        echo -e "  当前生效策略 : ${CYAN}${cur_up}${PLAIN}"
+        echo -e "${DIV_THIN}"
+        echo -e "  ${GREEN}[1]${PLAIN} 全球自动优选组 (Global Auto)   : Quad9-ECS + CF + Google + DNS.SB + AdGuard"
+        echo -e "  ${GREEN}[2]${PLAIN} 台湾本土流媒体 (Taiwan Local)  : HiNet + Google(台湾) + CF(台北) + AdGuard + 自动换IP路由"
+        echo -e "  ${GREEN}[3]${PLAIN} 亚太新港日优化 (HK / JP / SG)  : DNS.SB + AdGuard + 日本IIJ + CF + Google"
+        echo -e "  ${GREEN}[4]${PLAIN} 欧洲纯 IP 专线 (UK / DE / NL)  : Quad9-ECS + CF + Mullvad(194.242) + DNS.SB"
+        echo -e "  ${GREEN}[5]${PLAIN} 北美专线极速组 (US / CA)       : Quad9-ECS + CF + OpenDNS + ControlD(p0)"
+        echo -e "  ${GREEN}[6]${PLAIN} 中国大陆防限速 (CN Mainland)   : 阿里DoH + 腾讯doh.pub + 360DoH 负载均衡"
+        echo -e "  ${GREEN}[7]${PLAIN} 自定义加密上游 (Custom URL)    : 手动输入主/备 DoH 或 DoT 地址"
+        echo -e "  ${GREEN}[0]${PLAIN} 返回主菜单     (Back to Main Menu)"
+        echo -e "${DIV_BOLD}"
+        local up_opt mode="" c1="" c2=""
+        read -rp "请选择策略编号 / Select strategy [0-7]: " up_opt </dev/tty
+        up_opt=$(echo "$up_opt" | tr -d '[:space:]')
+        [ -z "$up_opt" ] && continue
+
+        case "$up_opt" in
+            0) return 0 ;;
+            1) mode="global" ;;
+            2) mode="tw_opt" ;;
+            3) mode="apac_opt" ;;
+            4) mode="eu_opt" ;;
+            5) mode="na_opt" ;;
+            6) mode="cn_opt" ;;
+            7)
+                mode="custom"
+                echo ""
+                read -rp "  请输入主加密 DNS (留空取消，如 https://dns.hinet.net/dns-query): " c1 </dev/tty
+                c1=$(echo "$c1" | tr -d '[:space:]')
+                if [ -z "$c1" ]; then
+                    echo -e "  ${YELLOW}[Info] 输入为空，已取消自定义配置。${PLAIN}"
+                    sleep 1
+                    continue
+                fi
+                read -rp "  请输入备加密 DNS (回车默认 https://94.140.14.140/dns-query): " c2 </dev/tty
+                c2=$(echo "$c2" | tr -d '[:space:]')
+                [ -z "$c2" ] && c2="https://94.140.14.140/dns-query"
+                ;;
+            *)
+                echo -e "\n${RED}[Warn] 无效选项 '${up_opt}'，请输入 0-7 之间的数字！${PLAIN}"
+                sleep 1
+                continue
+                ;;
+        esac
+        echo ""
+        run_deploy_core "$mode" "$c1" "$c2" 0
+        pause_submenu
+    done
 }
 
 benchmark_global_upstreams() {
@@ -1034,45 +1086,67 @@ show_live_logs() {
     echo -e "${DIV_BOLD}"
 }
 
+# 二级子菜单 [10]：独立循环驻留，按 0 返回主菜单
 update_self_and_core() {
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}在线无损更新 / Lossless Update (Script + dnsproxy Core)${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 仅更新管理脚本 (${GH_REPO}) [GitHub 主源 + Cloudflare 回退]"
-    echo -e "  ${GREEN}[2]${PLAIN} 仅检查并更新 AdGuard dnsproxy 内核二进制 (平滑热重启)"
-    echo -e "  ${GREEN}[3]${PLAIN} 同时更新管理脚本 + dnsproxy 内核"
-    echo -e "${DIV_THIN}"
-    local u_opt
-    read -rp "请选择更新项 [1-3, 回车取消]: " u_opt </dev/tty
-    u_opt=$(echo "$u_opt" | tr -d '[:space:]')
+    while true; do
+        local cur_bin="未安装"
+        [ -x "$BIN_PATH" ] && cur_bin=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
 
-    if [[ "$u_opt" = "2" || "$u_opt" = "3" ]]; then
-        local old_bin_ver="" new_bin_ver=""
-        [ -x "$BIN_PATH" ] && old_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
-        if install_binary 1; then
-            new_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
-            if [ "$old_bin_ver" != "$new_bin_ver" ] && systemctl is-active --quiet easy-doh; then
-                systemctl restart easy-doh
-                echo -e "${GREEN}  -> 已平滑重启服务应用新内核 (${new_bin_ver})！${PLAIN}"
-            fi
-        fi
-    fi
+        clear
+        echo -e "${DIV_BOLD}"
+        echo -e " ${CYAN}在线无损更新 / Lossless Update (Script + dnsproxy Core)${PLAIN}"
+        echo -e "${DIV_BOLD}"
+        echo -e "  当前脚本版本 : ${CYAN}v${VERSION}${PLAIN} (${GH_REPO}) | 当前内核版本 : ${CYAN}${cur_bin}${PLAIN}"
+        echo -e "${DIV_THIN}"
+        echo -e "  ${GREEN}[1]${PLAIN} 仅更新管理脚本 (${GH_REPO}) [GitHub 主源 + Cloudflare 回退]"
+        echo -e "  ${GREEN}[2]${PLAIN} 仅检查并更新 AdGuard dnsproxy 内核二进制 (平滑热重启)"
+        echo -e "  ${GREEN}[3]${PLAIN} 同时更新管理脚本 + dnsproxy 内核"
+        echo -e "  ${GREEN}[0]${PLAIN} 返回主菜单 (Back to Main Menu)"
+        echo -e "${DIV_BOLD}"
+        local u_opt
+        read -rp "请选择更新项 / Select option [0-3]: " u_opt </dev/tty
+        u_opt=$(echo "$u_opt" | tr -d '[:space:]')
+        [ -z "$u_opt" ] && continue
 
-    if [[ "$u_opt" = "1" || "$u_opt" = "3" ]]; then
-        echo -e "${CYAN}  -> 正在从远程仓库 (${GH_REPO}) 拉取最新 doh.sh ...${PLAIN}"
-        if fetch_remote_script "${SCRIPT_PATH}.new"; then
-            local remote_ver
-            remote_ver=$(grep -m1 '^VERSION=' "${SCRIPT_PATH}.new" | cut -d'"' -f2)
-            mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
-            echo -e "${GREEN}  -> 脚本已同步至最新 (v${VERSION} -> v${remote_ver:-latest})！正在重载面板...${PLAIN}"
-            sleep 1
-            exec "$SCRIPT_PATH" </dev/tty
-        else
-            rm -f "${SCRIPT_PATH}.new"
-            echo -e "${RED}[Warn] 远程拉取失败（请确认 GitHub 仓库 ${GH_REPO} 已设为 Public 且存在 doh.sh）。${PLAIN}"
-        fi
-    fi
+        case "$u_opt" in
+            0) return 0 ;;
+            1|2|3)
+                echo ""
+                if [[ "$u_opt" = "2" || "$u_opt" = "3" ]]; then
+                    local old_bin_ver="" new_bin_ver=""
+                    [ -x "$BIN_PATH" ] && old_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
+                    if install_binary 1; then
+                        new_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
+                        if [ "$old_bin_ver" != "$new_bin_ver" ] && systemctl is-active --quiet easy-doh; then
+                            systemctl restart easy-doh
+                            echo -e "${GREEN}  -> 已平滑重启服务应用新内核 (${new_bin_ver})！${PLAIN}"
+                        fi
+                    fi
+                fi
+
+                if [[ "$u_opt" = "1" || "$u_opt" = "3" ]]; then
+                    echo -e "${CYAN}  -> 正在从远程仓库 (${GH_REPO}) 拉取最新 doh.sh ...${PLAIN}"
+                    if fetch_remote_script "${SCRIPT_PATH}.new"; then
+                        local remote_ver
+                        remote_ver=$(grep -m1 '^VERSION=' "${SCRIPT_PATH}.new" | cut -d'"' -f2)
+                        mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
+                        chmod +x "$SCRIPT_PATH"
+                        echo -e "${GREEN}  -> 脚本已同步至最新 (v${VERSION} -> v${remote_ver:-latest})！正在重载面板...${PLAIN}"
+                        sleep 1
+                        exec "$SCRIPT_PATH" </dev/tty
+                    else
+                        rm -f "${SCRIPT_PATH}.new"
+                        echo -e "${RED}[Warn] 远程拉取失败（请确认 GitHub 仓库 ${GH_REPO} 已设为 Public 且存在 doh.sh）。${PLAIN}"
+                    fi
+                fi
+                pause_submenu
+                ;;
+            *)
+                echo -e "\n${RED}[Warn] 无效选项 '${u_opt}'，请输入 0-3 之间的数字！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 purge_core() {
@@ -1129,22 +1203,49 @@ purge_core() {
     fi
 }
 
+# 二级子菜单 [11]：独立循环驻留 + 二次防误触确认，按 0 秒回主菜单
 uninstall_all() {
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}彻底卸载与无痕清理 / Complete Uninstall & Zero-Trace Purge${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e "  ${YELLOW}[1]${PLAIN} 卸载服务 + 还原 DNS + ${RED}清空所有备份/路由/内核${PLAIN} (保留 doh 命令备用)"
-    echo -e "  ${RED}[2]${PLAIN} 100% 零残留彻底抹除 (${RED}连同 /usr/local/bin/doh 脚本一起自毁删除${PLAIN})"
-    echo -e "  ${GRAY}[0]${PLAIN} 取消返回 (Cancel)"
-    echo -e "${DIV_THIN}"
-    local u_mode
-    read -rp "请选择清理级别 / Select purge level [0-2]: " u_mode </dev/tty
-    u_mode=$(echo "$u_mode" | tr -d '[:space:]')
-    case "$u_mode" in
-        1) purge_core 0 ;;
-        2) purge_core 1 ;;
-        *) echo -e "${GRAY}已取消卸载操作。${PLAIN}" ;;
-    esac
+    while true; do
+        clear
+        echo -e "${DIV_BOLD}"
+        echo -e " ${CYAN}彻底卸载与无痕清理 / Complete Uninstall & Zero-Trace Purge${PLAIN}"
+        echo -e "${DIV_BOLD}"
+        echo -e "  ${YELLOW}[1]${PLAIN} 卸载服务 + 还原 DNS + ${RED}清空所有备份/路由/内核${PLAIN} (保留 doh 命令备用)"
+        echo -e "  ${RED}[2]${PLAIN} 100% 零残留彻底抹除 (${RED}连同 /usr/local/bin/doh 脚本一起自毁删除${PLAIN})"
+        echo -e "  ${GREEN}[0]${PLAIN} 返回主菜单 (Back to Main Menu)"
+        echo -e "${DIV_BOLD}"
+        local u_mode confirm_yn
+        read -rp "请选择清理级别 / Select purge level [0-2]: " u_mode </dev/tty
+        u_mode=$(echo "$u_mode" | tr -d '[:space:]')
+        [ -z "$u_mode" ] && continue
+
+        case "$u_mode" in
+            0) return 0 ;;
+            1)
+                read -rp "  确认卸载服务并清空所有备份与路由吗？[y/N]: " confirm_yn </dev/tty
+                if [[ "$confirm_yn" =~ ^[Yy]$ ]]; then
+                    purge_core 0
+                    pause_submenu
+                else
+                    echo -e "  ${GRAY}已取消执行。${PLAIN}"
+                    sleep 1
+                fi
+                ;;
+            2)
+                read -rp "  确认 100% 零残留彻底抹除 (含删除 doh 脚本本身) 吗？[y/N]: " confirm_yn </dev/tty
+                if [[ "$confirm_yn" =~ ^[Yy]$ ]]; then
+                    purge_core 1
+                else
+                    echo -e "  ${GRAY}已取消执行。${PLAIN}"
+                    sleep 1
+                fi
+                ;;
+            *)
+                echo -e "\n${RED}[Warn] 无效选项 '${u_mode}'，请输入 0-2 之间的数字！${PLAIN}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 render_menu() {
@@ -1220,7 +1321,6 @@ render_menu() {
     echo -e "${DIV_BOLD}"
 }
 
-# CLI 非交互快捷参数: doh --changeip | doh --route-isp | doh --auto tw | doh --purge
 case "${1:-}" in
     --auto)
         cp -f "$0" "$SCRIPT_PATH" 2>/dev/null && chmod +x "$SCRIPT_PATH"
@@ -1257,10 +1357,11 @@ while true; do
     choice=$(echo "$choice" | tr -d '[:space:]')
     [ -z "$choice" ] && continue
 
+    # 二级子菜单 (1/3/10/11) 自带内部驻留循环，按 0 直接秒回主界面，无需外部二次 pause_return
     case "$choice" in
-        1) deploy_doh_wizard; pause_return ;;
+        1) deploy_doh_wizard ;;
         2) enable_native_dot; pause_return ;;
-        3) manage_isp_changeip; pause_return ;;
+        3) manage_isp_changeip ;;
         4) fix_docker_dns 0; pause_return ;;
         5) test_all_dns; pause_return ;;
         6) benchmark_global_upstreams; pause_return ;;
@@ -1276,8 +1377,8 @@ while true; do
             fi
             pause_return
             ;;
-        10) update_self_and_core; pause_return ;;
-        11) uninstall_all; pause_return ;;
+        10) update_self_and_core ;;
+        11) uninstall_all ;;
         0) echo ""; exit 0 ;;
         *)
             echo -e "\n${RED}[Warn] 无效选项 '${choice}'，请输入 0-11 之间的数字！${PLAIN}"
