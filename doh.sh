@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Project   : E-Doh Manager (v3.1 Release)
+# Project   : E-Doh Manager (v3.2 Release)
 # Repo      : https://github.com/xtonly/E-Doh
-# Features  : Dead-Node Auto-Prune | Multi-API Bootstrap | Docker Guard | Purge
+# Features  : Dead-Node Auto-Prune | Zero-Python Docker Guard | Zero-Trace Purge
 # Usage     : Interactive -> doh | CLI -> doh --auto [global|tw|apac|eu|na|cn] | doh --purge
 # ==============================================================================
 
-VERSION="3.1"
+VERSION="3.2"
 GH_REPO="xtonly/E-Doh"
 GH_BRANCH="main"
 SCRIPT_PATH="/usr/local/bin/doh"
@@ -80,7 +80,6 @@ probe_doh_alive() {
     [ "$code" = "200" ]
 }
 
-# 优选最稳定的纯 IP Bootstrap (优先 Google/CF/AdGuard，避开对特殊记录偶发丢包的 TWNIC)
 pick_best_bootstrap() {
     local prefer="$1"
     local candidates=("$prefer" "8.8.8.8" "1.1.1.1" "94.140.14.140" "185.222.222.222" "101.101.101.101" "223.5.5.5")
@@ -268,8 +267,6 @@ write_doh_config() {
         tw|tw_opt)
             group_label="TW Local"
             pref_boot="8.8.8.8"
-            # 台湾组优先使用全记录类型 100% 兼容的 HiNet + Google(彰化) + CF(台北) + AdGuard + DNS.SB
-            # (避免 TWNIC 101.101.101.101 遇到 _https._tcp SVCB 查询时偶发 3s 超时日志)
             candidates=(
                 "HiNet|https://dns.hinet.net/dns-query"
                 "Google|https://8.8.8.8/dns-query"
@@ -359,7 +356,6 @@ write_doh_config() {
         fi
     done
 
-    # 若台湾组遇到 Google/CF/AdGuard 全被黑洞的极端情况，自动补入 TWNIC 101.101.101.101 救场
     if [[ "$mode" == tw* ]] && [ ${#alive_urls[@]} -lt 2 ]; then
         if probe_doh_alive "https://101.101.101.101/dns-query" "$boot_ip"; then
             alive_urls+=("https://101.101.101.101/dns-query")
@@ -456,6 +452,7 @@ R_EOF
     return 0
 }
 
+# 免 Python3 原生兼容的 Docker 网桥 DNS 守护器 (已配置时幂等秒过，绝不误报黄字)
 fix_docker_dns() {
     local silent_mode="${1:-0}"
     if ! command -v docker >/dev/null 2>&1; then
@@ -463,15 +460,14 @@ fix_docker_dns() {
         return 0
     fi
 
-    local dip reload_dk="y"
+    local dip reload_dk="y" need_restart=0
     dip=$(get_docker_ip)
     [ -z "$dip" ] && dip="172.17.0.1"
 
-    echo -e "${CYAN}  -> 检测到 Docker，正在注入网桥 DNS (${dip}) 防回退 8.8.8.8...${PLAIN}"
-    backup_configs
-    mkdir -p /etc/docker
+    mkdir -p /etc/docker "$WORK_DIR"
     echo "$dip" > "${WORK_DIR}/docker_ip.state"
 
+    # 确保防火墙放行 docker0 -> 53
     if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
         ufw allow in on docker0 to any port 53 >/dev/null 2>&1
     fi
@@ -480,7 +476,34 @@ fix_docker_dns() {
         iptables -C INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
     fi
 
-    if command -v python3 >/dev/null 2>&1; then
+    # 确保 dnsproxy 监听列表包含 docker0 网关
+    if [ -f "$CONF_FILE" ] && ! grep -q "$dip" "$CONF_FILE"; then
+        sed -i "/listen-addrs:/a \  - \"${dip}\"" "$CONF_FILE"
+        systemctl restart easy-doh
+    fi
+
+    # 幂等检查：如果 daemon.json 已经写好了该网桥 IP 且无残留明文 8.8.8.8，直接绿灯通过！
+    if [ -s "$DOCKER_DAEMON" ] && grep -q "\"${dip}\"" "$DOCKER_DAEMON" 2>/dev/null && ! grep -qE '"(8\.8\.8\.8|8\.8\.4\.4|1\.1\.1\.1)"' "$DOCKER_DAEMON" 2>/dev/null; then
+        echo -e "${GREEN}  -> Docker 容器网桥 DNS (${dip}:53) 已处于受保护状态，无需重复修改！${PLAIN}"
+        return 0
+    fi
+
+    echo -e "${CYAN}  -> 检测到 Docker，正在注入网桥 DNS (${dip}) 防回退 8.8.8.8...${PLAIN}"
+    backup_configs
+
+    # 三级无损 JSON 写入器：空文件直接写 -> jq -> python3 -> 纯 sed 注入
+    if [ ! -s "$DOCKER_DAEMON" ] || [ "$(tr -d '[:space:]' < "$DOCKER_DAEMON")" = "{}" ]; then
+        printf '{\n  "dns": ["%s"]\n}\n' "$dip" > "$DOCKER_DAEMON"
+        need_restart=1
+    elif command -v jq >/dev/null 2>&1; then
+        local tmp_jq="${DOCKER_DAEMON}.tmp"
+        if jq --arg dip "$dip" '.dns = ([$dip] + ((.dns // []) | map(select(. != $dip and . != "8.8.8.8" and . != "8.8.4.4" and . != "1.1.1.1"))))' "$DOCKER_DAEMON" > "$tmp_jq" 2>/dev/null && [ -s "$tmp_jq" ]; then
+            mv -f "$tmp_jq" "$DOCKER_DAEMON"
+            need_restart=1
+        else
+            rm -f "$tmp_jq"
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
         python3 - "$DOCKER_DAEMON" "$dip" << 'PY_EOF'
 import json, sys, os
 path, dip = sys.argv[1], sys.argv[2]
@@ -496,25 +519,25 @@ data["dns"] = dns_list
 with open(path, 'w') as f:
     json.dump(data, f, indent=2)
 PY_EOF
-    elif [ ! -s "$DOCKER_DAEMON" ]; then
-        printf '{\n  "dns": ["%s"]\n}\n' "$dip" > "$DOCKER_DAEMON"
+        need_restart=1
+    elif ! grep -q '"dns"' "$DOCKER_DAEMON" 2>/dev/null; then
+        # 纯 Shell 注入：若原 JSON 没有 "dns" 键，直接在首个 '{' 后插入
+        sed -i "0,/{/s/{/{\n  \"dns\": [\"${dip}\"],/" "$DOCKER_DAEMON"
+        need_restart=1
     else
-        echo -e "${YELLOW}[Warn] 请手动在 ${DOCKER_DAEMON} 中加入 \"dns\": [\"${dip}\"]${PLAIN}"
+        echo -e "${YELLOW}[Warn] 检测到自定义 daemon.json，请确认其中包含 \"dns\": [\"${dip}\"]${PLAIN}"
         return 0
     fi
 
-    if [ -f "$CONF_FILE" ] && ! grep -q "$dip" "$CONF_FILE"; then
-        sed -i "/listen-addrs:/a \  - \"${dip}\"" "$CONF_FILE"
-        systemctl restart easy-doh
-    fi
-
-    if [ "$silent_mode" -eq 0 ]; then
-        read -rp "  -> 是否立即重启 Docker 使容器生效？(Restart Docker now?) [Y/n]: " reload_dk </dev/tty
-    fi
-    if [[ ! "$reload_dk" =~ ^[Nn]$ ]]; then
-        systemctl restart docker
-        systemctl restart easy-doh
-        echo -e "${GREEN}  -> Docker 容器 DNS 通道已打通 (${dip}:53 -> DoH)！${PLAIN}"
+    if [ "$need_restart" -eq 1 ]; then
+        if [ "$silent_mode" -eq 0 ]; then
+            read -rp "  -> 是否立即重启 Docker 使容器生效？(Restart Docker now?) [Y/n]: " reload_dk </dev/tty
+        fi
+        if [[ ! "$reload_dk" =~ ^[Nn]$ ]]; then
+            systemctl restart docker
+            systemctl restart easy-doh
+            echo -e "${GREEN}  -> Docker 容器 DNS 通道已打通 (${dip}:53 -> DoH)！${PLAIN}"
+        fi
     fi
 }
 
@@ -533,7 +556,12 @@ revert_docker_dns() {
     fi
 
     if [ -f "$DOCKER_DAEMON" ] && grep -q "$dip" "$DOCKER_DAEMON" 2>/dev/null; then
-        if command -v python3 >/dev/null 2>&1; then
+        if [ "$(grep -vE '^\s*([{}]|"dns")' "$DOCKER_DAEMON" | tr -d '[:space:]')" = "" ]; then
+            rm -f "$DOCKER_DAEMON"
+        elif command -v jq >/dev/null 2>&1; then
+            local tmp_jq="${DOCKER_DAEMON}.tmp"
+            jq --arg dip "$dip" 'if .dns then .dns |= map(select(. != $dip)) | if (.dns | length) == 0 then del(.dns) else . end else . end' "$DOCKER_DAEMON" > "$tmp_jq" 2>/dev/null && mv -f "$tmp_jq" "$DOCKER_DAEMON"
+        elif command -v python3 >/dev/null 2>&1; then
             python3 - "$DOCKER_DAEMON" "$dip" << 'PY_CLEAN'
 import json, sys, os
 path, dip = sys.argv[1], sys.argv[2]
@@ -552,6 +580,8 @@ try:
 except Exception:
     pass
 PY_CLEAN
+        else
+            sed -i "/\"dns\": \[\"${dip}\"\],*/d" "$DOCKER_DAEMON" 2>/dev/null || true
         fi
         command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker && systemctl restart docker 2>/dev/null || true
     fi
@@ -768,279 +798,4 @@ audit_leaks() {
     echo -e " ${YELLOW}[1] Docker 容器 DNS 检查 (Container DNS Check):${PLAIN}"
     if ! command -v docker >/dev/null 2>&1; then
         echo -e "     ${GRAY}未安装 Docker，无需检查 (Docker not installed - Clean).${PLAIN}"
-    elif [ -z "$(docker ps -q 2>/dev/null)" ]; then
-        echo -e "     ${GRAY}当前无运行中的容器 (No running containers - Clean).${PLAIN}"
-    else
-        for c in $(docker ps -q); do
-            local cname cdns ext
-            cname=$(docker inspect -f '{{.Name}} ({{.HostConfig.NetworkMode}})' "$c" | sed 's#^/##')
-            cdns=$(docker exec "$c" grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd "," -)
-            ext=$(docker exec "$c" grep 'ExtServers' /etc/resolv.conf 2>/dev/null || true)
-            printf "     - %-30s -> %s %s\n" "$cname" "${cdns:-未知}" "$ext"
-        done
-    fi
-
-    echo -e "\n ${YELLOW}[2] 代理与系统配置明文 DNS 扫描 (Config Hardcoded DNS Scan):${PLAIN}"
-    local hits
-    hits=$(grep -rnE '1\.1\.1\.1|8\.8\.8\.8|8\.8\.4\.4|9\.9\.9\.9|168\.95\.1\.1|139\.175\.|10\.30\.' \
-        /etc/ /opt/ /root/ /usr/local/etc/ /var/lib/ 2>/dev/null \
-        | grep -vE '/etc/easy-doh|/usr/local/bin/doh|99-native-dot|\.bak|\.orig|hosts|resolv\.conf|journal|\.log|overlay2|https://|tls://|quic://' \
-        | grep -E '\.(json|yaml|yml|toml|conf|ini|service):' | head -n 20 || true)
-    if [ -z "$hits" ]; then
-        echo -e "     ${GREEN}[OK] 未发现写死明文公共 53 DNS 的配置文件！${PLAIN}"
-    else
-        echo -e "${hits}" | sed 's/^/     /'
-    fi
-
-    echo -e "\n ${YELLOW}[3] 实时外部 53 端口连接抓捕 (Live Outbound Port 53 Sockets):${PLAIN}"
-    local live_53
-    live_53=$(ss -tunap 2>/dev/null | awk '$5 ~ /:53$/ && $5 !~ /127\.0\.0\.|172\.17\.0\.1|\*:53|0\.0\.0\.0:53|\[::\]:53/' || true)
-    if [ -z "$live_53" ]; then
-        echo -e "     ${GREEN}[OK] 完美！当前没有任何进程向外部 53 端口发起连接。${PLAIN}"
-    else
-        echo -e "${RED}${live_53}${PLAIN}" | sed 's/^/     /'
-    fi
-    echo -e "${DIV_BOLD}"
-}
-
-# 按 systemd 唯一实例 ID (_SYSTEMD_INVOCATION_ID) 精准过滤当前进程日志，彻底杜绝上一秒旧进程日志混入
-show_live_logs() {
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}当前实例运行日志 / Current Service Instance Logs${PLAIN}"
-    echo -e "${DIV_THIN}"
-    if systemctl is-active --quiet easy-doh; then
-        local inv_id
-        inv_id=$(systemctl show easy-doh -p InvocationID --value 2>/dev/null)
-        if [ -n "$inv_id" ]; then
-            journalctl _SYSTEMD_INVOCATION_ID="$inv_id" -n 30 --no-pager
-        else
-            journalctl -u easy-doh -n 25 --no-pager
-        fi
-    else
-        echo -e "  ${GRAY}当前服务未运行 (Service is currently stopped).${PLAIN}"
-    fi
-    echo -e "${DIV_BOLD}"
-}
-
-update_self_and_core() {
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}在线无损更新 / Lossless Update (Script + dnsproxy Core)${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 仅更新管理脚本 (${GH_REPO}) [GitHub 主源 + Cloudflare 回退]"
-    echo -e "  ${GREEN}[2]${PLAIN} 仅检查并更新 AdGuard dnsproxy 内核二进制 (平滑热重启)"
-    echo -e "  ${GREEN}[3]${PLAIN} 同时更新管理脚本 + dnsproxy 内核"
-    echo -e "${DIV_THIN}"
-    local u_opt
-    read -rp "请选择更新项 [1-3, 回车取消]: " u_opt </dev/tty
-    u_opt=$(echo "$u_opt" | tr -d '[:space:]')
-
-    if [[ "$u_opt" = "2" || "$u_opt" = "3" ]]; then
-        local old_bin_ver="" new_bin_ver=""
-        [ -x "$BIN_PATH" ] && old_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
-        if install_binary 1; then
-            new_bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
-            if [ "$old_bin_ver" != "$new_bin_ver" ] && systemctl is-active --quiet easy-doh; then
-                systemctl restart easy-doh
-                echo -e "${GREEN}  -> 已平滑重启服务应用新内核 (${new_bin_ver})！${PLAIN}"
-            fi
-        fi
-    fi
-
-    if [[ "$u_opt" = "1" || "$u_opt" = "3" ]]; then
-        echo -e "${CYAN}  -> 正在从远程仓库 (${GH_REPO}) 拉取最新 doh.sh ...${PLAIN}"
-        if fetch_remote_script "${SCRIPT_PATH}.new"; then
-            local remote_ver
-            remote_ver=$(grep -m1 '^VERSION=' "${SCRIPT_PATH}.new" | cut -d'"' -f2)
-            mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
-            chmod +x "$SCRIPT_PATH"
-            echo -e "${GREEN}  -> 脚本已同步至最新 (v${VERSION} -> v${remote_ver:-latest})！正在重载面板...${PLAIN}"
-            sleep 1
-            exec "$SCRIPT_PATH" </dev/tty
-        else
-            rm -f "${SCRIPT_PATH}.new"
-            echo -e "${RED}[Warn] 远程拉取失败（请确认 GitHub 仓库 ${GH_REPO} 已设为 Public 且存在 doh.sh）。${PLAIN}"
-        fi
-    fi
-}
-
-purge_core() {
-    local remove_self="${1:-0}"
-
-    echo -e "\n${CYAN}[1/4] 停止并移除加密 DNS 守护进程与全部历史日志...${PLAIN}"
-    systemctl stop easy-doh 2>/dev/null || true
-    systemctl disable easy-doh 2>/dev/null || true
-    systemctl stop doh-proxy 2>/dev/null || true
-    systemctl disable doh-proxy 2>/dev/null || true
-    rm -f "$SERVICE_FILE" /etc/systemd/system/doh-proxy.service /etc/default/doh-proxy
-    rm -f /etc/systemd/resolved.conf.d/99-easy-doh.conf \
-          /etc/systemd/resolved.conf.d/99-native-dot.conf \
-          /etc/systemd/resolved.conf.d/nodnsstub.conf
-    systemctl daemon-reload
-    journalctl --rotate >/dev/null 2>&1 || true
-    journalctl --vacuum-time=1s --unit=easy-doh >/dev/null 2>&1 || true
-
-    echo -e "${CYAN}[2/4] 恢复初始 /etc/resolv.conf 并解除防篡改锁...${PLAIN}"
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    if [ -f "${WORK_DIR}/resolv.symlink" ]; then
-        local sym_target
-        sym_target=$(cat "${WORK_DIR}/resolv.symlink")
-        rm -f /etc/resolv.conf
-        ln -sf "$sym_target" /etc/resolv.conf
-    elif [ -f "${WORK_DIR}/resolv.conf.orig" ]; then
-        rm -f /etc/resolv.conf
-        cp -f "${WORK_DIR}/resolv.conf.orig" /etc/resolv.conf
-    elif [ -f /etc/resolv.conf.doh.bak ]; then
-        mv -f /etc/resolv.conf.doh.bak /etc/resolv.conf
-    elif systemctl list-unit-files 2>/dev/null | grep -q "systemd-resolved"; then
-        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-    fi
-    systemctl is-enabled --quiet systemd-resolved 2>/dev/null && systemctl restart systemd-resolved 2>/dev/null || true
-
-    echo -e "${CYAN}[3/4] 清理 Docker 网桥注入规则与防火墙策略...${PLAIN}"
-    revert_docker_dns
-
-    echo -e "${CYAN}[4/4] 彻底清空所有备份归档、缓存状态与二进制内核...${PLAIN}"
-    rm -rf "$WORK_DIR"
-    rm -f "$BIN_PATH" "${BIN_PATH}.new" /etc/resolv.conf.doh.bak /tmp/doh_bench_*
-
-    if [ "$remove_self" -eq 1 ]; then
-        rm -f "$SCRIPT_PATH" "${SCRIPT_PATH}.new" "${SCRIPT_PATH}.tmp"
-        echo -e "\n${GREEN}[OK] 已完成 100% 零残留彻底卸载（包含所有备份、日志、内核与 doh 命令本身）！${PLAIN}\n"
-        exit 0
-    else
-        echo -e "\n${GREEN}[OK] 服务、内核、日志与全部历史备份已彻底清空！(仅保留 doh 管理脚本)${PLAIN}"
-    fi
-}
-
-uninstall_all() {
-    echo -e "\n${DIV_BOLD}"
-    echo -e " ${CYAN}彻底卸载与无痕清理 / Complete Uninstall & Zero-Trace Purge${PLAIN}"
-    echo -e "${DIV_THIN}"
-    echo -e "  ${YELLOW}[1]${PLAIN} 卸载服务 + 还原 DNS + ${RED}清空所有备份与内核${PLAIN} (保留 doh 命令备用)"
-    echo -e "  ${RED}[2]${PLAIN} 100% 零残留彻底抹除 (${RED}连同 /usr/local/bin/doh 脚本一起自毁删除${PLAIN})"
-    echo -e "  ${GRAY}[0]${PLAIN} 取消返回 (Cancel)"
-    echo -e "${DIV_THIN}"
-    local u_mode
-    read -rp "请选择清理级别 / Select purge level [0-2]: " u_mode </dev/tty
-    u_mode=$(echo "$u_mode" | tr -d '[:space:]')
-    case "$u_mode" in
-        1) purge_core 0 ;;
-        2) purge_core 1 ;;
-        *) echo -e "${GRAY}已取消卸载操作。${PLAIN}" ;;
-    esac
-}
-
-render_menu() {
-    local eng_str="${RED}○ Stopped (未运行)${PLAIN}"
-    local listen_str="N/A"
-    local up_str="None"
-    [ -f "$STATE_FILE" ] && up_str=$(cat "$STATE_FILE")
-
-    if systemctl is-active --quiet easy-doh; then
-        local bin_ver=""
-        [ -x "$BIN_PATH" ] && bin_ver=$("$BIN_PATH" --version 2>/dev/null | awk '{print $NF}')
-        eng_str="${GREEN}● Active  (dnsproxy ${bin_ver})${PLAIN}"
-        local addrs
-        addrs=$(grep -A3 'listen-addrs:' "$CONF_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd "," -)
-        listen_str="${addrs:-127.0.0.1}:53 (TCP + UDP)"
-    elif [ -f /etc/systemd/resolved.conf.d/99-native-dot.conf ] && systemctl is-active --quiet systemd-resolved; then
-        eng_str="${GREEN}● Active  (Native DoT 853)${PLAIN}"
-        listen_str="127.0.0.53:53 (TCP + UDP)"
-    fi
-
-    local lock_str="${YELLOW}Unlocked (未锁定)${PLAIN}"
-    lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i' && lock_str="${GREEN}Locked +i (防篡改已锁)${PLAIN}"
-
-    local dk_str="${GRAY}Not Installed (未安装 Docker)${PLAIN}"
-    if command -v docker >/dev/null 2>&1; then
-        local dip
-        dip=$(get_docker_ip)
-        if grep -q "${dip:-172.17.0.1}" "$DOCKER_DAEMON" 2>/dev/null; then
-            dk_str="${GREEN}Protected (${dip:-172.17.0.1}:53)${PLAIN}"
-        else
-            dk_str="${YELLOW}Unconfigured (建议执行 [3] 接管)${PLAIN}"
-        fi
-    fi
-
-    local bak_cnt=0
-    [ -d "$BACKUP_DIR" ] && bak_cnt=$(ls -1 "${BACKUP_DIR}"/dns_bak_*.tar.gz 2>/dev/null | wc -l)
-
-    clear
-    echo -e "${DIV_BOLD}"
-    echo -e "   ${CYAN}E-Doh Manager v${VERSION}${PLAIN}  |  本地加密 DNS 与全球分流管理面板 (cmd: ${GREEN}doh${PLAIN})"
-    echo -e "${DIV_BOLD}"
-    echo -e "  运行状态 Engine   : ${eng_str}"
-    echo -e "  监听端点 Listen   : ${listen_str}"
-    echo -e "  上游策略 Upstream : ${CYAN}${up_str}${PLAIN}"
-    echo -e "  系统锁定 Resolv   : ${lock_str}  [备份 Backups: ${bak_cnt}/3]"
-    echo -e "  容器环境 Docker   : ${dk_str}"
-    echo -e "${DIV_THIN}"
-    echo -e "  ${GREEN}[1]${PLAIN} 安装 / 切换分地区 DoH 策略    (Install / Switch Regional DoH)"
-    echo -e "  ${GREEN}[2]${PLAIN} 启用系统原生 DoT 急救模式     (Enable Native DoT 853)"
-    echo -e "  ${GREEN}[3]${PLAIN} 修复 Docker 容器 DNS 防回退   (Fix Docker Bridge DNS)"
-    echo -e "  ${GREEN}[4]${PLAIN} 实测本地 DNS 解析 (IPv4/IPv6) (Test Local DNS Resolution)"
-    echo -e "  ${GREEN}[5]${PLAIN} 全球 12 大 DoH 并发测速排行   (Global DoH Upstream Speedtest)"
-    echo -e "  ${GREEN}[6]${PLAIN} 全盘扫描 53 端口漏网之鱼      (Audit Port 53 Leaks)"
-    echo -e "  ${GREEN}[7]${PLAIN} 查看当前实例运行日志          (View Current Instance Logs)"
-    echo -e "  ${GREEN}[8]${PLAIN} 解锁 / 锁定 /etc/resolv.conf  (Toggle Resolv +i Lock)"
-    echo -e "  ${GREEN}[9]${PLAIN} 在线无损更新脚本与内核        (Lossless Update Script & Core)"
-    echo -e "  ${GREEN}[10]${PLAIN} 彻底卸载并清空全部备份       (Complete Uninstall & Purge)"
-    echo -e "  ${GREEN}[0]${PLAIN} 退出管理面板                  (Exit)"
-    echo -e "${DIV_BOLD}"
-}
-
-case "${1:-}" in
-    --auto)
-        cp -f "$0" "$SCRIPT_PATH" 2>/dev/null && chmod +x "$SCRIPT_PATH"
-        run_deploy_core "${2:-global}" "" "" 1
-        exit $?
-        ;;
-    --purge)
-        purge_core 1
-        ;;
-    --test)
-        test_all_dns
-        exit 0
-        ;;
-    --audit)
-        audit_leaks
-        exit 0
-        ;;
-esac
-
-bootstrap_self "$@"
-read -t 0.1 -n 10000 _discard 2>/dev/null || true
-
-while true; do
-    render_menu
-    read -rp "请输入选项编号 / Select option [0-10]: " choice </dev/tty
-    choice=$(echo "$choice" | tr -d '[:space:]')
-    [ -z "$choice" ] && continue
-
-    case "$choice" in
-        1) deploy_doh_wizard; pause_return ;;
-        2) enable_native_dot; pause_return ;;
-        3) fix_docker_dns 0; pause_return ;;
-        4) test_all_dns; pause_return ;;
-        5) benchmark_global_upstreams; pause_return ;;
-        6) audit_leaks; pause_return ;;
-        7) show_live_logs; pause_return ;;
-        8)
-            if lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
-                chattr -i /etc/resolv.conf
-                echo -e "\n${YELLOW}[OK] 已解锁 /etc/resolv.conf (Unlocked).${PLAIN}"
-            else
-                chattr +i /etc/resolv.conf
-                echo -e "\n${GREEN}[OK] 已锁定 /etc/resolv.conf (Locked +i).${PLAIN}"
-            fi
-            pause_return
-            ;;
-        9) update_self_and_core; pause_return ;;
-        10) uninstall_all; pause_return ;;
-        0) echo ""; exit 0 ;;
-        *)
-            echo -e "\n${RED}[Warn] 无效选项 '${choice}'，请输入 0-10 之间的数字！${PLAIN}"
-            sleep 1
-            ;;
-    esac
-done
+    elif [ -z "$(docker ps -q 2>/dev/null
